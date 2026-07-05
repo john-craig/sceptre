@@ -1,0 +1,16 @@
+[package]
+name = "rust-template"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "rust_template"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-template"
+path = "src/main.rs"
+
+[dependencies]
