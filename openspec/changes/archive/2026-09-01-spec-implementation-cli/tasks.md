@@ -1,0 +1,5 @@
+- [x] Add readiness, selection, status, materialization, publication, and feedback commands.
+- [x] Validate real repository mappings, upstream state, registered agent prefixes, dependencies, order, references, and cycles before remote operations.
+- [x] Document the manifest and invocation contract.
+- [x] Add focused validation and ordering tests.
+- [x] Consume sequence-form `spec_dependencies` and defer specs until same-repository dependencies are merged.

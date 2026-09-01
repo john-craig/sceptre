@@ -1,7 +1,10 @@
 use rust_template::{cli, run};
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("repository") {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("repository") | Some("specset")
+    ) {
         std::process::exit(cli());
     }
 
