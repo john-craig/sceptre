@@ -1,0 +1,8 @@
+schema: spec-driven
+
+context: |
+  Sceptre provides MCP and CLI tools for interacting with the Grimoire
+  automated development workflow. It handles idea creation and processing,
+  repository creation, specification implementation, and integration
+  synchronization through configured remote Git providers. Host services own
+  scheduling, OpenCode workers, worktrees, and deployment.
