@@ -69,6 +69,22 @@ remote branch and canonical-record duplicates, and removes its temporary clone
 after success or failure. GitHub remotes require `gh`; Gitea remotes require
 `tea`. Provider and Git diagnostics are redacted and never forwarded.
 
+## MCP server
+
+Run the stdio MCP server against a Grimoire repository mapping with:
+
+```text
+sceptre mcp serve --repository PATH
+```
+
+The server speaks line-delimited JSON-RPC 2.0 and supports `initialize`,
+`notifications/initialized`, `tools/list`, and `tools/call`. It exposes one
+`create_idea` tool with the same seven required text fields as the CLI and an
+optional `id`. The mapping supplied by `--repository` is used for every tool
+call. Successful calls return the CLI result as JSON MCP text content; validation
+and remote-write failures return structured JSON MCP content with `isError: true`.
+Protocol responses are written only to stdout.
+
 ## Specification implementation
 
 The machine-readable implementation interface is:

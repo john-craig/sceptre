@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -88,6 +89,21 @@ enum CommandLine {
     Repository(RepositoryCommand),
     Specset(SpecsetCommand),
     Idea(IdeaCommand),
+    Mcp(McpCommand),
+}
+
+#[derive(Args, Debug)]
+struct McpCommand {
+    #[command(subcommand)]
+    command: McpAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    Serve {
+        #[arg(long)]
+        repository: PathBuf,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -214,6 +230,16 @@ impl Provider {
 pub fn cli() -> i32 {
     let cli = Cli::parse();
     let result = match cli.command {
+        CommandLine::Mcp(mcp) => {
+            let McpAction::Serve { repository } = mcp.command;
+            return match mcp_serve(&repository) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("MCP server error: {error}");
+                    1
+                }
+            };
+        }
         CommandLine::Repository(repo) => {
             let RepositoryAction::Create {
                 definition,
@@ -263,6 +289,175 @@ pub fn cli() -> i32 {
             1
         }
     }
+}
+
+fn mcp_serve(repository: &Path) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if let Some(response) = handle_mcp_request(repository, &line) {
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Handle one line-delimited JSON-RPC request. `None` denotes a notification.
+pub fn handle_mcp_request(repository: &Path, input: &str) -> Option<String> {
+    let value: serde_json::Value = match serde_json::from_str(input) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(rpc_error(
+                serde_json::Value::Null,
+                -32700,
+                error.to_string(),
+            ))
+        }
+    };
+    let object = match value.as_object() {
+        Some(object) => object,
+        None => {
+            return Some(rpc_error(
+                serde_json::Value::Null,
+                -32600,
+                "request must be an object",
+            ))
+        }
+    };
+    let id = object.get("id").cloned();
+    let is_notification = !object.contains_key("id");
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+        || object
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Some(rpc_error(
+            id.unwrap_or(serde_json::Value::Null),
+            -32600,
+            "invalid JSON-RPC 2.0 request",
+        ));
+    }
+    let method = object
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let response = match method {
+        "initialize" => rpc_result(
+            id.clone().unwrap_or(serde_json::Value::Null),
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "sceptre", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        ),
+        "notifications/initialized" => return None,
+        "tools/list" => rpc_result(
+            id.clone().unwrap_or(serde_json::Value::Null),
+            serde_json::json!({"tools": [create_idea_tool()] }),
+        ),
+        "tools/call" => match call_tool(repository, object.get("params")) {
+            Ok(result) => rpc_result(id.clone().unwrap_or(serde_json::Value::Null), result),
+            Err((code, message)) => {
+                rpc_error(id.clone().unwrap_or(serde_json::Value::Null), code, message)
+            }
+        },
+        _ => rpc_error(
+            id.clone().unwrap_or(serde_json::Value::Null),
+            -32601,
+            "method not found",
+        ),
+    };
+    if is_notification {
+        None
+    } else {
+        Some(response)
+    }
+}
+
+fn create_idea_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "create_idea",
+        "description": "Create a Grimoire idea on a verified remote branch",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"}, "problem": {"type": "string"},
+                "desired_outcome": {"type": "string"}, "scope": {"type": "string"},
+                "non_goals": {"type": "string"}, "constraints": {"type": "string"},
+                "open_questions": {"type": "string"}, "id": {"type": "string"}
+            },
+            "required": ["title", "problem", "desired_outcome", "scope", "non_goals", "constraints", "open_questions"]
+        }
+    })
+}
+
+fn call_tool(
+    repository: &Path,
+    params: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, (i32, &'static str)> {
+    let params = params
+        .and_then(serde_json::Value::as_object)
+        .ok_or((-32602, "params.arguments must be an object"))?;
+    if params.get("name").and_then(serde_json::Value::as_str) != Some("create_idea") {
+        return Err((-32601, "tool not found"));
+    }
+    let arguments = params
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or((-32602, "params.arguments must be an object"))?;
+    let get = |name: &'static str| {
+        arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or((-32602, "tool arguments must be strings"))
+    };
+    let title = get("title")?;
+    let problem = get("problem")?;
+    let desired_outcome = get("desired_outcome")?;
+    let scope = get("scope")?;
+    let non_goals = get("non_goals")?;
+    let constraints = get("constraints")?;
+    let open_questions = get("open_questions")?;
+    let id = arguments
+        .get("id")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or((-32602, "tool arguments must be strings"))
+        })
+        .transpose()?;
+    match create_idea(
+        repository,
+        IdeaInput {
+            title,
+            problem,
+            desired_outcome,
+            scope,
+            non_goals,
+            constraints,
+            open_questions,
+            id,
+        },
+    ) {
+        Ok(result) => Ok(
+            serde_json::json!({"content": [{"type": "text", "text": serde_json::to_string(&result).unwrap()}]}),
+        ),
+        Err(error) => Ok(
+            serde_json::json!({"isError": true, "content": [{"type": "text", "text": serde_json::to_string(&error).unwrap()}]}),
+        ),
+    }
+}
+
+fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string()
+}
+
+fn rpc_error(id: serde_json::Value, code: i32, message: impl Into<String>) -> String {
+    serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message.into()}})
+        .to_string()
 }
 
 #[derive(Debug, Serialize)]

@@ -1,0 +1,6 @@
+- [x] Add `mcp serve --repository PATH` command and line-delimited JSON-RPC loop.
+- [x] Implement `initialize`, `notifications/initialized`, `tools/list`, and `tools/call`.
+- [x] Expose `create_idea` with the shared CLI input contract and validation path.
+- [x] Return MCP content for tool results and structured `isError` failures.
+- [x] Add protocol and CLI/MCP consistency tests.
+- [x] Document configuration and protocol behavior.
