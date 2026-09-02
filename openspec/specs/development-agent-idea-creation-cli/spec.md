@@ -37,3 +37,30 @@ idea creation behavior.
 - **WHEN** equivalent valid content is submitted through MCP and CLI
 - **THEN** both interfaces SHALL produce records conforming to the same
   Grimoire format and branch contract
+
+### Requirement: The CLI creates canonical ideas safely
+
+Sceptre SHALL expose `idea create` with required idea content and an optional
+ID. It SHALL derive a stable lowercase kebab-case ID from the title when one is
+not supplied, validate explicit IDs, and reject empty required values. It SHALL
+write the canonical `ideas/<id>/IDEA.md` format with `processed: false`.
+
+#### Scenario: Valid idea is pushed
+
+- **WHEN** the repository mapping is valid and the requested idea does not
+  already exist
+- **THEN** Sceptre SHALL create and verify the remote `idea/<id>` branch from
+  the configured default branch and return machine-readable details
+
+#### Scenario: Existing idea is protected
+
+- **WHEN** `idea/<id>` or `ideas/<id>/IDEA.md` already exists remotely
+- **THEN** Sceptre SHALL return a non-zero duplicate error without modifying the
+  existing record
+
+### Requirement: Idea creation is isolated and redacted
+
+Sceptre SHALL select the configured GitHub or Gitea provider tooling, perform
+  Git work in an isolated temporary clone, suppress provider and Git output,
+  avoid credentials in arguments and results, and remove the temporary clone on
+  both success and failure.

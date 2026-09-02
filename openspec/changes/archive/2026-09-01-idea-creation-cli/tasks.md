@@ -1,0 +1,7 @@
+- [x] Add structured `idea create` arguments and JSON result/error handling.
+- [x] Validate required content and stable lowercase kebab-case IDs.
+- [x] Render canonical `ideas/<id>/IDEA.md` records.
+- [x] Select and validate GitHub/Gitea provider tooling.
+- [x] Protect remote branch and canonical-record duplicates.
+- [x] Clone, commit, push, verify, and clean up isolated work.
+- [x] Document the command and add focused tests.

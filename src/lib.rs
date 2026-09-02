@@ -87,6 +87,37 @@ struct Cli {
 enum CommandLine {
     Repository(RepositoryCommand),
     Specset(SpecsetCommand),
+    Idea(IdeaCommand),
+}
+
+#[derive(Args, Debug)]
+struct IdeaCommand {
+    #[command(subcommand)]
+    command: IdeaAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum IdeaAction {
+    Create {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        problem: String,
+        #[arg(long, value_name = "TEXT")]
+        desired_outcome: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        non_goals: String,
+        #[arg(long)]
+        constraints: String,
+        #[arg(long)]
+        open_questions: String,
+        #[arg(long)]
+        id: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -195,6 +226,32 @@ pub fn cli() -> i32 {
                 .map(|body| serde_json::to_value(body).unwrap())
         }
         CommandLine::Specset(specset) => run_specset(specset.command),
+        CommandLine::Idea(idea) => match idea.command {
+            IdeaAction::Create {
+                repository,
+                title,
+                problem,
+                desired_outcome,
+                scope,
+                non_goals,
+                constraints,
+                open_questions,
+                id,
+            } => create_idea(
+                &repository,
+                IdeaInput {
+                    title: &title,
+                    problem: &problem,
+                    desired_outcome: &desired_outcome,
+                    scope: &scope,
+                    non_goals: &non_goals,
+                    constraints: &constraints,
+                    open_questions: &open_questions,
+                    id: id.as_deref(),
+                },
+            )
+            .map(|body| serde_json::to_value(body).unwrap()),
+        },
     };
     match result {
         Ok(body) => {
@@ -1350,6 +1407,269 @@ fn create_repository(
     Ok(result(&definition, &provider, "created"))
 }
 
+struct IdeaInput<'a> {
+    title: &'a str,
+    problem: &'a str,
+    desired_outcome: &'a str,
+    scope: &'a str,
+    non_goals: &'a str,
+    constraints: &'a str,
+    open_questions: &'a str,
+    id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct IdeaResult {
+    status: &'static str,
+    id: String,
+    branch: String,
+    commit: String,
+    repository: String,
+    path: String,
+    provider: &'static str,
+}
+
+const IDEA_PATH: &str = "ideas/{id}/IDEA.md";
+
+fn derive_idea_id(title: &str) -> String {
+    let mut id = String::new();
+    for character in title.chars() {
+        if character.is_ascii_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_end_matches('-').to_owned()
+}
+
+fn validate_idea_id(id: &str) -> Result<(), ErrorBody<'static>> {
+    let valid = !id.is_empty()
+        && id.len() <= 80
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("--");
+    if valid {
+        Ok(())
+    } else {
+        Err(err(
+            "invalid_idea_id",
+            "idea ID must be 1-80 characters of lowercase letters, digits, and single hyphens"
+                .into(),
+        ))
+    }
+}
+
+fn required_idea_text(name: &str, value: &str) -> Result<(), ErrorBody<'static>> {
+    if value.trim().is_empty() {
+        Err(err(
+            "missing_content",
+            format!("--{name} must not be empty"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn render_idea(input: &IdeaInput<'_>) -> String {
+    format!(
+        "---\nprocessed: false\n---\n\n# {}\n\n## Problem\n{}\n\n## Desired Outcome\n{}\n\n## Scope\n{}\n\n## Non-Goals\n{}\n\n## Constraints\n{}\n\n## Open Questions\n{}\n",
+        input.title.trim(),
+        input.problem.trim(),
+        input.desired_outcome.trim(),
+        input.scope.trim(),
+        input.non_goals.trim(),
+        input.constraints.trim(),
+        input.open_questions.trim()
+    )
+}
+
+fn create_idea(
+    repository_path: &Path,
+    input: IdeaInput<'_>,
+) -> Result<IdeaResult, ErrorBody<'static>> {
+    for (name, value) in [
+        ("title", input.title),
+        ("problem", input.problem),
+        ("desired-outcome", input.desired_outcome),
+        ("scope", input.scope),
+        ("non-goals", input.non_goals),
+        ("constraints", input.constraints),
+        ("open-questions", input.open_questions),
+    ] {
+        required_idea_text(name, value)?;
+    }
+    let id = input
+        .id
+        .map_or_else(|| derive_idea_id(input.title), str::to_owned);
+    validate_idea_id(&id)?;
+    let mapping: RealRepositoryMapping = read_catalog_value(repository_path)?;
+    if mapping.upstream.trim().is_empty() || mapping.default_branch.trim().is_empty() {
+        return Err(err(
+            "invalid_repository_mapping",
+            "repository mapping must contain non-empty upstream and default_branch".into(),
+        ));
+    }
+    if !mapping.upstream_created {
+        return Err(err(
+            "repository_not_created",
+            "repository mapping has upstream_created=false; create the upstream first".into(),
+        ));
+    }
+    let provider = provider_for(&mapping.upstream)?;
+    if !tool_available(provider.tool()) {
+        return Err(err(
+            "provider_unavailable",
+            format!(
+                "required executable '{}' was not found in PATH",
+                provider.tool()
+            ),
+        ));
+    }
+    let branch = format!("idea/{id}");
+    let git_upstream = git_url(&mapping.upstream, false);
+    if remote_ref_exists(&git_upstream, &branch)? {
+        return Err(err(
+            "duplicate_idea",
+            format!("remote branch '{branch}' already exists; choose another ID"),
+        ));
+    }
+
+    let work = temporary_directory(&id)?;
+    let cleanup = TempCleanup::new(work.clone());
+    let clone_path = work.to_str().ok_or_else(|| {
+        err(
+            "filesystem_error",
+            "isolated clone path is not valid UTF-8".into(),
+        )
+    })?;
+    run_git(&[
+        "clone",
+        "--branch",
+        &mapping.default_branch,
+        "--single-branch",
+        &git_upstream,
+        clone_path,
+    ])?;
+    let record_path = IDEA_PATH.replace("{id}", &id);
+    if git_ref_path_exists(&work, &mapping.default_branch, &record_path)? {
+        return Err(err(
+            "duplicate_idea",
+            format!("canonical idea record '{record_path}' already exists; choose another ID"),
+        ));
+    }
+    let destination = work.join(&record_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| err("filesystem_error", "could not create idea directory".into()))?;
+    }
+    fs::write(&destination, render_idea(&input))
+        .map_err(|_| err("filesystem_error", "could not write IDEA.md".into()))?;
+    run_git_in(&work, &["add", &record_path])?;
+    run_git_in(&work, &["commit", "-m", &format!("Create idea {id}")])?;
+    let commit = git_output(&work, &["rev-parse", "HEAD"])?;
+    let commit = commit.trim().to_owned();
+    run_git_in(&work, &["push", "-u", "origin", &branch])?;
+    let remote_commit = remote_commit(&git_upstream, &branch)?;
+    if remote_commit != commit {
+        return Err(err(
+            "verification_failed",
+            format!("remote branch '{branch}' did not resolve to the committed IDEA.md"),
+        ));
+    }
+    drop(cleanup);
+    Ok(IdeaResult {
+        status: "created",
+        id,
+        branch,
+        commit,
+        repository: redact_remote(&mapping.upstream),
+        path: record_path,
+        provider: provider.name(),
+    })
+}
+
+struct TempCleanup(PathBuf);
+impl TempCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn remote_ref_exists(remote: &str, branch: &str) -> Result<bool, ErrorBody<'static>> {
+    let output = Command::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .map_err(|_| err("git_error", "could not check the remote idea branch".into()))?;
+    if output.status.success() {
+        Ok(!output.stdout.is_empty())
+    } else if output.status.code() == Some(2) {
+        // `--exit-code` uses status 2 when the remote is reachable but the ref
+        // does not exist. Other failures must not be mistaken for a free ID.
+        Ok(false)
+    } else {
+        Err(err(
+            "git_error",
+            "could not verify whether the remote idea branch exists".into(),
+        ))
+    }
+}
+
+fn remote_commit(remote: &str, branch: &str) -> Result<String, ErrorBody<'static>> {
+    let output = command_output(
+        "git",
+        &["ls-remote", remote, &format!("refs/heads/{branch}")],
+        "verify pushed idea",
+    )?;
+    output
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            err(
+                "verification_failed",
+                format!("remote branch '{branch}' was not found after push"),
+            )
+        })
+}
+
+fn git_ref_path_exists(work: &Path, branch: &str, path: &str) -> Result<bool, ErrorBody<'static>> {
+    let reference = format!("origin/{branch}:{path}");
+    let output = Command::new("git")
+        .current_dir(work)
+        .args(["cat-file", "-e", &reference])
+        .output()
+        .map_err(|_| {
+            err(
+                "git_error",
+                "could not inspect the canonical idea record".into(),
+            )
+        })?;
+    Ok(output.status.success())
+}
+
+fn redact_remote(remote: &str) -> String {
+    if let Some((scheme, rest)) = remote.split_once("://") {
+        if let Some((_, host)) = rest.split_once('@') {
+            return format!("{scheme}://[redacted]@{host}");
+        }
+    }
+    remote.to_owned()
+}
+
 fn validate_local_source(path: &Path) -> Result<(), ErrorBody<'static>> {
     let valid = Command::new("git")
         .current_dir(path)
@@ -1775,6 +2095,57 @@ mod tests {
         assert_eq!(
             git_url("https://gitlab.com/a/b.git", false),
             "https://gitlab.com/a/b.git"
+        );
+    }
+
+    #[test]
+    fn derives_stable_kebab_case_idea_ids() {
+        assert_eq!(
+            derive_idea_id("Plan OAuth 2.0 / Login"),
+            "plan-oauth-2-0-login"
+        );
+        assert_eq!(derive_idea_id("  Already--Stable  "), "already-stable");
+    }
+
+    #[test]
+    fn validates_explicit_idea_ids() {
+        assert!(validate_idea_id("valid-idea-2").is_ok());
+        assert!(validate_idea_id("Not-valid").is_err());
+        assert!(validate_idea_id("two--hyphens").is_err());
+    }
+
+    #[test]
+    fn renders_canonical_idea_sections() {
+        let input = IdeaInput {
+            title: "A title",
+            problem: "A problem",
+            desired_outcome: "An outcome",
+            scope: "The scope",
+            non_goals: "Not this",
+            constraints: "A constraint",
+            open_questions: "A question",
+            id: None,
+        };
+        let rendered = render_idea(&input);
+        assert!(rendered.starts_with("---\nprocessed: false\n---\n"));
+        for section in [
+            "# A title",
+            "## Problem",
+            "## Desired Outcome",
+            "## Scope",
+            "## Non-Goals",
+            "## Constraints",
+            "## Open Questions",
+        ] {
+            assert!(rendered.contains(section), "missing {section}");
+        }
+    }
+
+    #[test]
+    fn redacts_credentials_in_remote_results() {
+        assert_eq!(
+            redact_remote("https://token:secret@example.test/a/b"),
+            "https://[redacted]@example.test/a/b"
         );
     }
 

@@ -51,6 +51,24 @@ reused without overwriting its contents, and receives the verified upstream as
 - `nix run .#rust-template-tests`
 - `nix develop`
 
+## Idea creation
+
+Create a Grimoire idea on a remote `idea/<id>` branch with one JSON result:
+
+```text
+sceptre idea create --repository PATH --title TITLE --problem TEXT \
+  --desired-outcome TEXT --scope TEXT --non-goals TEXT --constraints TEXT \
+  --open-questions TEXT [--id ID]
+```
+
+`PATH` is a repository mapping JSON containing `id`, `upstream`,
+`default_branch`, and `upstream_created`. IDs are derived from the title when
+omitted and must be lowercase kebab-case. The command writes
+`ideas/<id>/IDEA.md`, starts from the configured default branch, checks both
+remote branch and canonical-record duplicates, and removes its temporary clone
+after success or failure. GitHub remotes require `gh`; Gitea remotes require
+`tea`. Provider and Git diagnostics are redacted and never forwarded.
+
 ## Specification implementation
 
 The machine-readable implementation interface is:
