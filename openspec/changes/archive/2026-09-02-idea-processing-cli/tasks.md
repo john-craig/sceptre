@@ -1,0 +1,4 @@
+- [x] Add pending discovery and processing status commands.
+- [x] Add deterministic branch preparation and idempotent PR publication.
+- [x] Add bounded GitHub/Gitea feedback retrieval with redacted diagnostics.
+- [x] Add fixture-based catalog tests and document the command interface.

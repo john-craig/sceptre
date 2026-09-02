@@ -89,7 +89,117 @@ enum CommandLine {
     Repository(RepositoryCommand),
     Specset(SpecsetCommand),
     Idea(IdeaCommand),
+    IdeaProcess(IdeaProcessCommand),
+    Integration(IntegrationCommand),
     Mcp(McpCommand),
+}
+
+#[derive(Args, Debug)]
+struct IdeaProcessCommand {
+    #[command(subcommand)]
+    command: IdeaProcessAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum IdeaProcessAction {
+    Pending {
+        #[arg(long)]
+        catalog: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        idea_id: String,
+    },
+    Prepare {
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        idea_id: String,
+    },
+    Publish {
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        idea_id: String,
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        title: Option<String>,
+    },
+    Feedback {
+        #[arg(long)]
+        upstream: String,
+        #[arg(long)]
+        number: u64,
+    },
+}
+
+#[derive(Args, Debug)]
+struct IntegrationCommand {
+    #[command(subcommand)]
+    command: IntegrationAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum IntegrationAction {
+    Candidates {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        repository: Option<String>,
+    },
+    Merge {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        specification: String,
+        #[arg(long)]
+        number: u64,
+    },
+    Sync {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        specification: String,
+        #[arg(long)]
+        merge_commit: String,
+        #[arg(long)]
+        number: u64,
+    },
+    Cleanup {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        catalog: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        specification: String,
+        #[arg(long)]
+        number: u64,
+        #[arg(long)]
+        sync_commit: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -278,6 +388,8 @@ pub fn cli() -> i32 {
             )
             .map(|body| serde_json::to_value(body).unwrap()),
         },
+        CommandLine::IdeaProcess(command) => run_idea_process(command.command),
+        CommandLine::Integration(command) => run_integration(command.command),
     };
     match result {
         Ok(body) => {
@@ -604,10 +716,623 @@ fn run_specset(action: SpecsetAction) -> Result<serde_json::Value, ErrorBody<'st
     }
 }
 
+#[derive(Debug, Serialize)]
+struct IdeaRecord {
+    id: String,
+    path: String,
+    processed: bool,
+    pull_requests: serde_json::Value,
+}
+
+fn run_idea_process(action: IdeaProcessAction) -> Result<serde_json::Value, ErrorBody<'static>> {
+    match action {
+        IdeaProcessAction::Feedback { upstream, number } => {
+            let provider = provider_for(&upstream)?;
+            Ok(
+                serde_json::json!({"status":"ok", "upstream":redact_remote(&upstream), "number":number,
+                "feedback":bound_feedback(provider_feedback(&provider, &upstream, number)?)}),
+            )
+        }
+        IdeaProcessAction::Pending { catalog } => {
+            let mapping: RealRepositoryMapping =
+                read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+            let provider = provider_for(&mapping.upstream)?;
+            let mut records = Vec::new();
+            for (id, path) in idea_files(&catalog.join("ideas"))? {
+                let text = fs::read_to_string(&path)
+                    .map_err(|_| err("input_error", "cannot read idea record".into()))?;
+                if frontmatter_processed(&text) == Some(false) {
+                    let prs = provider_prs(&provider, &mapping.upstream, &format!("spec/{id}"))?;
+                    records.push(IdeaRecord {
+                        id,
+                        path: path.display().to_string(),
+                        processed: false,
+                        pull_requests: prs,
+                    });
+                }
+            }
+            Ok(
+                serde_json::json!({"status":"ok", "repository":redact_remote(&mapping.upstream), "ideas":records}),
+            )
+        }
+        IdeaProcessAction::Status { catalog, idea_id } => idea_process_status(&catalog, &idea_id),
+        IdeaProcessAction::Prepare { catalog, idea_id } => idea_process_prepare(&catalog, &idea_id),
+        IdeaProcessAction::Publish {
+            catalog,
+            idea_id,
+            worktree,
+            message,
+            title,
+        } => {
+            let mapping: RealRepositoryMapping =
+                read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+            let provider = provider_for(&mapping.upstream)?;
+            let branch = format!("spec/{idea_id}");
+            run_git_in(&worktree, &["checkout", "-B", &branch])?;
+            run_git_in(&worktree, &["add", "openspec"])?;
+            let changed = Command::new("git")
+                .current_dir(&worktree)
+                .args(["diff", "--cached", "--quiet"])
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(false);
+            if changed {
+                run_git_in(&worktree, &["commit", "-m", &message])?;
+            }
+            run_git_in(&worktree, &["push", "-u", "origin", &branch])?;
+            let prs = provider_prs(&provider, &mapping.upstream, &branch)?;
+            let pr = upsert_pr(
+                &provider,
+                &mapping.upstream,
+                &branch,
+                &mapping.default_branch,
+                title.as_deref().unwrap_or(&idea_id),
+                &message,
+                prs,
+            )?;
+            Ok(
+                serde_json::json!({"status":"published", "idea_id":idea_id, "branch":branch, "pull_request":pr}),
+            )
+        }
+    }
+}
+
+fn idea_process_status(catalog: &Path, id: &str) -> Result<serde_json::Value, ErrorBody<'static>> {
+    validate_idea_id(id)?;
+    let mapping: RealRepositoryMapping = read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+    let provider = provider_for(&mapping.upstream)?;
+    let path = idea_files(&catalog.join("ideas"))?
+        .into_iter()
+        .find(|(candidate, _)| candidate == id)
+        .map(|(_, p)| p);
+    let Some(path) = path else {
+        return Ok(serde_json::json!({"status":"unknown", "idea_id":id}));
+    };
+    let prs = provider_prs(&provider, &mapping.upstream, &format!("spec/{id}"))?;
+    Ok(
+        serde_json::json!({"status": if frontmatter_processed(&fs::read_to_string(path).unwrap_or_default()) == Some(true) {"processed"} else {"pending"}, "idea_id":id, "pull_requests":prs}),
+    )
+}
+
+fn idea_process_prepare(catalog: &Path, id: &str) -> Result<serde_json::Value, ErrorBody<'static>> {
+    validate_idea_id(id)?;
+    let mapping: RealRepositoryMapping = read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+    let provider = provider_for(&mapping.upstream)?;
+    let branch = format!("spec/{id}");
+    let exists = remote_ref_exists(&git_url(&mapping.upstream, false), &branch)?;
+    let prs = provider_prs(&provider, &mapping.upstream, &branch)?;
+    Ok(
+        serde_json::json!({"status":if exists {"reused"} else {"prepared"}, "idea_id":id, "branch":branch, "branch_exists":exists, "pull_requests":prs}),
+    )
+}
+
+fn idea_files(root: &Path) -> Result<Vec<(String, PathBuf)>, ErrorBody<'static>> {
+    fn visit(dir: &Path, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                visit(&path, out)?;
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("IDEA.md") {
+                if let Some(id) = path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                {
+                    out.push((id.to_owned(), path));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut result = Vec::new();
+    visit(root, &mut result)
+        .map_err(|_| err("input_error", format!("cannot scan '{}'", root.display())))?;
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(result)
+}
+
+fn frontmatter_processed(text: &str) -> Option<bool> {
+    let mut in_frontmatter = false;
+    for line in text.lines() {
+        if line.trim() == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if in_frontmatter && line.trim().starts_with("processed:") {
+            return line.split_once(':').and_then(|(_, v)| match v.trim() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+        }
+    }
+    None
+}
+
+fn upsert_pr(
+    provider: &Provider,
+    upstream: &str,
+    branch: &str,
+    default_branch: &str,
+    title: &str,
+    body: &str,
+    prs: serde_json::Value,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let matches: Vec<&serde_json::Value> = prs
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|pr| {
+                    pr.get("headRefName")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|head| head == branch)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if matches.len() > 1 {
+        return Err(err(
+            "provider_error",
+            format!("multiple pull requests match branch '{branch}'"),
+        ));
+    }
+    if let Some(pr) = matches.first() {
+        let number = pr
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                err(
+                    "provider_error",
+                    "matching pull request has no number".into(),
+                )
+            })?;
+        command(
+            provider.tool(),
+            &["pr", "edit", &number.to_string(), "--title", title],
+            "update pull request",
+        )?;
+        return Ok(serde_json::json!({"number":number,"status":"updated"}));
+    }
+    let base = if default_branch.is_empty() {
+        "main"
+    } else {
+        default_branch
+    };
+    let output = match provider {
+        Provider::Github => command_output(
+            "gh",
+            &[
+                "pr", "create", "--repo", upstream, "--head", branch, "--base", base, "--title",
+                title, "--body", body,
+            ],
+            "create pull request",
+        )?,
+        Provider::Gitea => command_output(
+            "tea",
+            &[
+                "pr",
+                "create",
+                "--repo",
+                upstream,
+                "--head",
+                branch,
+                "--base",
+                base,
+                "--title",
+                title,
+                "--description",
+                body,
+            ],
+            "create pull request",
+        )?,
+    };
+    Ok(serde_json::json!({"status":"created", "provider_result":redact_remote(output.trim())}))
+}
+
+fn run_integration(action: IntegrationAction) -> Result<serde_json::Value, ErrorBody<'static>> {
+    match action {
+        IntegrationAction::Candidates { manifest, catalog } => {
+            integration_candidates(&manifest, &catalog, None, false)
+        }
+        IntegrationAction::Status {
+            manifest,
+            catalog,
+            repository,
+        } => integration_candidates(&manifest, &catalog, repository.as_deref(), true),
+        IntegrationAction::Merge {
+            manifest,
+            catalog,
+            repository,
+            specification,
+            number,
+        } => integration_merge(&manifest, &catalog, &repository, &specification, number),
+        IntegrationAction::Sync {
+            manifest,
+            catalog,
+            repository,
+            specification,
+            merge_commit,
+            number,
+        } => integration_sync(
+            &manifest,
+            &catalog,
+            &repository,
+            &specification,
+            &merge_commit,
+            number,
+        ),
+        IntegrationAction::Cleanup {
+            manifest,
+            catalog,
+            repository,
+            specification,
+            number,
+            sync_commit,
+        } => integration_cleanup(
+            &manifest,
+            &catalog,
+            &repository,
+            &specification,
+            number,
+            &sync_commit,
+        ),
+    }
+}
+
+fn integration_candidates(
+    manifest_path: &Path,
+    catalog: &Path,
+    repository_filter: Option<&str>,
+    include_closed: bool,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let manifest: RealManifest = read_catalog_value(manifest_path)?;
+    let state = load_real_state(&manifest, manifest_path, catalog)?;
+    let branch = real_branch_name(&manifest);
+    let mut candidates = Vec::new();
+    for repo in &state.repositories {
+        if repository_filter.is_some_and(|filter| filter != repo.id) {
+            continue;
+        }
+        let provider = provider_for(&repo.upstream)?;
+        let prs = provider_prs(&provider, &repo.upstream, &branch)?;
+        if let Some(items) = prs.as_array() {
+            for pr in items {
+                if !include_closed
+                    && !pr
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("open"))
+                {
+                    continue;
+                }
+                if let Some(spec) = repo
+                    .specs
+                    .iter()
+                    .find(|spec| pr_spec_matches(pr, &spec.directory))
+                {
+                    let review_status = pr
+                        .get("number")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|number| integration_status(&provider, &repo.upstream, number))
+                        .transpose()?
+                        .map(|(status, _)| status)
+                        .unwrap_or_else(|| "pending".into());
+                    candidates.push(serde_json::json!({
+                        "repository":repo.id,
+                        "specification":spec.directory,
+                        "branch":branch,
+                        "status":review_status,
+                        "pull_request":pr
+                    }));
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({"status":"ok", "specset_id":manifest.id, "candidates":candidates}))
+}
+
+fn find_repo_spec(
+    manifest_path: &Path,
+    catalog: &Path,
+    repository: &str,
+    specification: &str,
+) -> Result<(RealManifest, RealRepository, RealSpec), ErrorBody<'static>> {
+    let manifest: RealManifest = read_catalog_value(manifest_path)?;
+    let state = load_real_state(&manifest, manifest_path, catalog)?;
+    let repo = state
+        .repositories
+        .into_iter()
+        .find(|r| r.id == repository)
+        .ok_or_else(|| err("input_error", "repository is not in manifest".into()))?;
+    let spec = repo
+        .specs
+        .iter()
+        .find(|s| s.directory == specification)
+        .ok_or_else(|| {
+            err(
+                "input_error",
+                "specification is not in manifest catalog".into(),
+            )
+        })?;
+    let selected = RealSpec {
+        directory: spec.directory.clone(),
+        agent: spec.agent.clone(),
+        dependencies: spec.dependencies.clone(),
+        source: spec.source.clone(),
+    };
+    Ok((manifest, repo, selected))
+}
+
+fn integration_status(
+    provider: &Provider,
+    upstream: &str,
+    number: u64,
+) -> Result<(String, serde_json::Value), ErrorBody<'static>> {
+    let feedback = provider_feedback(provider, upstream, number)?;
+    let state = feedback
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let reviews = feedback
+        .get("reviews")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut status = "pending";
+    if state.eq_ignore_ascii_case("merged") {
+        status = "merged";
+    } else if reviews.iter().any(|r| {
+        r.get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("changes_requested"))
+    }) {
+        status = "changes-requested";
+    } else if reviews.iter().any(|r| {
+        r.get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("approved"))
+    }) {
+        status = "approved";
+    }
+    Ok((status.into(), feedback))
+}
+
+fn integration_merge(
+    manifest_path: &Path,
+    catalog: &Path,
+    repository: &str,
+    specification: &str,
+    number: u64,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let (manifest, repo, _) = find_repo_spec(manifest_path, catalog, repository, specification)?;
+    let provider = provider_for(&repo.upstream)?;
+    let (status, _) = integration_status(&provider, &repo.upstream, number)?;
+    if status == "merged" {
+        return Ok(serde_json::json!({"status":"merged","repository":repository,"number":number}));
+    }
+    if status != "approved" {
+        return Ok(
+            serde_json::json!({"status":status,"repository":repository,"number":number,"merged":false}),
+        );
+    }
+    let n = number.to_string();
+    match provider {
+        Provider::Github => command(
+            "gh",
+            &["pr", "merge", &n, "--repo", &repo.upstream, "--merge"],
+            "merge pull request",
+        )?,
+        Provider::Gitea => command(
+            "tea",
+            &["pr", "merge", &n, "--repo", &repo.upstream],
+            "merge pull request",
+        )?,
+    }
+    let feedback = provider_feedback(&provider, &repo.upstream, number)?;
+    let commit = feedback
+        .get("mergeCommit")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("oid").and_then(serde_json::Value::as_str))
+        })
+        .unwrap_or("")
+        .to_owned();
+    if commit.is_empty() {
+        return Err(err(
+            "verification_failed",
+            "provider did not return a merged commit".into(),
+        ));
+    }
+    Ok(
+        serde_json::json!({"status":"merged","specset_id":manifest.id,"repository":repository,"number":number,"merge_commit":commit}),
+    )
+}
+
+fn integration_sync(
+    manifest_path: &Path,
+    catalog: &Path,
+    repository: &str,
+    specification: &str,
+    merge_commit: &str,
+    number: u64,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    if merge_commit.is_empty() {
+        return Err(err("input_error", "merge commit is required".into()));
+    }
+    let (manifest, repo, spec) = find_repo_spec(manifest_path, catalog, repository, specification)?;
+    let grimoire: RealRepositoryMapping = read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+    let source = temporary_directory(&format!("sync-{repository}"))?;
+    let cleanup = TempCleanup::new(source.clone());
+    let clone = source.join("upstream");
+    let clone_str = clone
+        .to_str()
+        .ok_or_else(|| err("filesystem_error", "temporary path is not UTF-8".into()))?;
+    run_git(&[
+        "clone",
+        "--no-checkout",
+        &git_url(&repo.upstream, false),
+        clone_str,
+    ])?;
+    run_git_in(&clone, &["checkout", merge_commit])?;
+    let source_file = clone
+        .join("openspec/specs")
+        .join(&spec.directory)
+        .join("spec.md");
+    if !source_file.is_file() {
+        return Err(err(
+            "synchronization_failed",
+            "merged implementation specification is missing".into(),
+        ));
+    }
+    let destination = catalog
+        .join("specs")
+        .join(&manifest.topic)
+        .join(&manifest.project)
+        .join(&manifest.id)
+        .join("grimoire")
+        .join("openspec/specs")
+        .join(&spec.directory);
+    fs::create_dir_all(&destination).map_err(|_| {
+        err(
+            "filesystem_error",
+            "cannot create canonical destination".into(),
+        )
+    })?;
+    let destination_file = destination.join("spec.md");
+    if fs::read(&destination_file).ok() == fs::read(&source_file).ok() {
+        return Ok(
+            serde_json::json!({"status":"synchronized","commit":null,"destination":destination_file}),
+        );
+    }
+    fs::copy(&source_file, &destination_file).map_err(|_| {
+        err(
+            "filesystem_error",
+            "cannot update canonical specification".into(),
+        )
+    })?;
+    let grimoire_path = catalog.join(".");
+    run_git_in(
+        &grimoire_path,
+        &[
+            "add",
+            destination_file
+                .strip_prefix(catalog)
+                .unwrap_or(&destination)
+                .to_str()
+                .unwrap_or(""),
+        ],
+    )?;
+    run_git_in(
+        &grimoire_path,
+        &[
+            "commit",
+            "-m",
+            &format!("Synchronize {repository}/{specification} from PR {number}"),
+        ],
+    )?;
+    let grimoire_remote = git_url(&grimoire.upstream, false);
+    run_git_in(
+        &grimoire_path,
+        &["push", &grimoire_remote, &grimoire.default_branch],
+    )?;
+    let commit = git_output(&grimoire_path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_owned();
+    let remote_commit = git_output(
+        &grimoire_path,
+        &[
+            "ls-remote",
+            &grimoire_remote,
+            &format!("refs/heads/{}", grimoire.default_branch),
+        ],
+    )?
+    .split_whitespace()
+    .next()
+    .unwrap_or("")
+    .to_owned();
+    if remote_commit != commit {
+        return Err(err(
+            "verification_failed",
+            "remote Grimoire branch does not contain the synchronization commit".into(),
+        ));
+    }
+    drop(cleanup);
+    Ok(
+        serde_json::json!({"status":"synchronized","commit":commit,"destination":destination_file,"source_commit":merge_commit}),
+    )
+}
+
+fn integration_cleanup(
+    manifest_path: &Path,
+    catalog: &Path,
+    repository: &str,
+    specification: &str,
+    number: u64,
+    sync_commit: &str,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    if sync_commit.is_empty() {
+        return Err(err(
+            "input_error",
+            "--sync-commit is required to prove synchronization".into(),
+        ));
+    }
+    let (_, repo, _) = find_repo_spec(manifest_path, catalog, repository, specification)?;
+    let provider = provider_for(&repo.upstream)?;
+    let (status, _) = integration_status(&provider, &repo.upstream, number)?;
+    if status != "merged" {
+        return Ok(
+            serde_json::json!({"status":"preserved","reason":"integration is not verified complete"}),
+        );
+    }
+    let branch = format!(
+        "feature/{}",
+        read_catalog_value::<RealManifest>(manifest_path)?.id
+    );
+    run_git(&["push", &git_url(&repo.upstream, false), "--delete", &branch])?;
+    if remote_ref_exists(&git_url(&repo.upstream, false), &branch)? {
+        return Err(err(
+            "verification_failed",
+            "source branch still exists after cleanup".into(),
+        ));
+    }
+    Ok(
+        serde_json::json!({"status":"cleaned","branch":branch,"deleted":true,"sync_commit":sync_commit}),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct RealManifest {
     #[serde(alias = "specset_id", alias = "specsetId")]
     id: String,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    topic: String,
     #[serde(default)]
     repositories: Vec<String>,
     #[serde(default, alias = "implementationOrder")]
@@ -798,6 +1523,8 @@ fn load_real_state(
     Ok(RealState {
         manifest: RealManifest {
             id: manifest.id.clone(),
+            project: manifest.project.clone(),
+            topic: manifest.topic.clone(),
             repositories: manifest.repositories.clone(),
             implementation_order: manifest.implementation_order.clone(),
             spec_dependencies: manifest.spec_dependencies.clone(),
@@ -1323,7 +2050,7 @@ fn provider_feedback(
                 "--repo",
                 upstream,
                 "--json",
-                "number,state,reviews,comments",
+                "number,state,reviews,comments,mergeCommit",
             ],
             "read pull-request feedback",
         )?,
@@ -2381,6 +3108,48 @@ mod tests {
             "# base spec\n"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_nested_pending_ideas_without_accepting_processed_records() {
+        let root = test_directory("ideas");
+        let ideas = root.join("ideas/topic");
+        fs::create_dir_all(ideas.join("pending")).unwrap();
+        fs::create_dir_all(ideas.join("done")).unwrap();
+        fs::write(
+            ideas.join("pending/IDEA.md"),
+            "---\nprocessed: false\n---\n",
+        )
+        .unwrap();
+        fs::write(ideas.join("done/IDEA.md"), "---\nprocessed: true\n---\n").unwrap();
+        let files = idea_files(&root.join("ideas")).unwrap();
+        assert_eq!(
+            files.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["done", "pending"]
+        );
+        assert_eq!(
+            frontmatter_processed(&fs::read_to_string(&files[0].1).unwrap()),
+            Some(true)
+        );
+        assert_eq!(
+            frontmatter_processed(&fs::read_to_string(&files[1].1).unwrap()),
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_requires_synchronization_proof() {
+        let error = integration_cleanup(
+            Path::new("missing"),
+            Path::new("missing"),
+            "repo",
+            "spec",
+            1,
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "input_error");
     }
 
     fn test_directory(label: &str) -> std::path::PathBuf {

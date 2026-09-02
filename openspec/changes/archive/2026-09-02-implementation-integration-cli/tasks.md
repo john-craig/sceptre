@@ -1,0 +1,4 @@
+- [x] Add candidate discovery and review-state status commands.
+- [x] Add explicit approval-gated, idempotent merge handling and commit verification.
+- [x] Add canonical merged-spec synchronization with no arbitrary destination.
+- [x] Add synchronization-gated SSH branch cleanup and focused tests/documentation.

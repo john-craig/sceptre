@@ -118,3 +118,28 @@ consider a matching merged PR complete. `publish` reuses
 `feature/<specset-id>` and updates the one matching PR when it already exists.
 Sceptre does not start workers, create worktrees, schedule jobs, or deploy
 services.
+
+## Idea processing and integration
+
+The service-facing command families are:
+
+```text
+sceptre idea-process pending --catalog GRIMOIRE
+sceptre idea-process status --catalog GRIMOIRE --idea-id ID
+sceptre idea-process prepare --catalog GRIMOIRE --idea-id ID
+sceptre idea-process publish --catalog GRIMOIRE --idea-id ID --worktree PATH --message MESSAGE [--title TITLE]
+sceptre idea-process feedback --upstream URL --number PR_NUMBER
+
+sceptre integration candidates --manifest MANIFEST --catalog GRIMOIRE
+sceptre integration status --manifest MANIFEST --catalog GRIMOIRE [--repository ID]
+sceptre integration merge --manifest MANIFEST --catalog GRIMOIRE --repository ID --specification SPEC --number PR_NUMBER
+sceptre integration sync --manifest MANIFEST --catalog GRIMOIRE --repository ID --specification SPEC --merge-commit COMMIT --number PR_NUMBER
+sceptre integration cleanup --manifest MANIFEST --catalog GRIMOIRE --repository ID --specification SPEC --number PR_NUMBER --sync-commit COMMIT
+```
+
+These commands emit one JSON object and never start workers, schedulers,
+worktrees, or deployment. Idea records are discovered under nested
+`ideas/**/IDEA.md` paths. Integration source and destination paths are resolved
+from the manifest and the real Grimoire layout; no synchronization destination
+argument is accepted. Git uses SSH URLs by default, while `gh` and `tea` use
+their configured credentials. Provider and Git diagnostics are redacted.

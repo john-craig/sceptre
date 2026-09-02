@@ -46,3 +46,28 @@ fn idea_create_help_exposes_machine_readable_inputs() {
         assert!(stdout.contains(argument), "missing {argument}");
     }
 }
+
+#[test]
+fn workflow_command_families_expose_json_workflow_operations() {
+    let bin = env!("CARGO_BIN_EXE_rust-template");
+    for (family, commands) in [
+        (
+            "idea-process",
+            ["pending", "status", "prepare", "publish", "feedback"],
+        ),
+        (
+            "integration",
+            ["candidates", "status", "merge", "sync", "cleanup"],
+        ),
+    ] {
+        let output = Command::new(bin)
+            .args([family, "--help"])
+            .output()
+            .expect("binary to run");
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).expect("utf8 help");
+        for command in commands {
+            assert!(help.contains(command), "missing {family} {command}");
+        }
+    }
+}
