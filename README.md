@@ -147,3 +147,9 @@ creates or reuses `spec/<idea-id>` from the configured default branch, and
 verifies the remote branch before returning. Integration cleanup accepts only a
 verified synchronization commit from the Grimoire default branch. Provider and
 Git diagnostics are redacted.
+
+`idea-process publish` expects the prepared worktree to contain planning changes
+under the repository-root `specs/` directory, including nested layouts such as
+`specs/<project>/<topic>/...`. It stages only that subtree and returns a
+structured input error without pushing or touching a pull request when the
+subtree is missing or has no changes.

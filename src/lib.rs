@@ -768,17 +768,9 @@ fn run_idea_process(action: IdeaProcessAction) -> Result<serde_json::Value, Erro
                 read_catalog_value(&catalog.join("repos/grimoire.json"))?;
             let provider = provider_for(&mapping.upstream)?;
             let branch = format!("spec/{idea_id}");
+            stage_idea_planning_subtree(&worktree)?;
             run_git_in(&worktree, &["checkout", "-B", &branch])?;
-            run_git_in(&worktree, &["add", "openspec"])?;
-            let changed = Command::new("git")
-                .current_dir(&worktree)
-                .args(["diff", "--cached", "--quiet"])
-                .output()
-                .map(|o| !o.status.success())
-                .unwrap_or(false);
-            if changed {
-                run_git_in(&worktree, &["commit", "-m", &message])?;
-            }
+            run_git_in(&worktree, &["commit", "-m", &message])?;
             run_git_in(&worktree, &["push", "-u", "origin", &branch])?;
             let prs = provider_prs(&provider, &mapping.upstream, &branch)?;
             let pr = upsert_pr(
@@ -795,6 +787,39 @@ fn run_idea_process(action: IdeaProcessAction) -> Result<serde_json::Value, Erro
             )
         }
     }
+}
+
+fn stage_idea_planning_subtree(worktree: &Path) -> Result<(), ErrorBody<'static>> {
+    let specs = worktree.join("specs");
+    if !specs.is_dir() {
+        return Err(err(
+            "input_error",
+            "prepared worktree is missing the repository-root specs directory".into(),
+        ));
+    }
+
+    // Use a pathspec so nested project/topic directories retain their paths and
+    // unrelated worktree files cannot be added by this publisher.
+    run_git_in(worktree, &["add", "--", "specs"])?;
+    let staged = git_output(worktree, &["diff", "--cached", "--name-only"])?;
+    let mut has_specs_change = false;
+    for path in staged.lines().filter(|path| !path.is_empty()) {
+        if path == "specs" || path.starts_with("specs/") {
+            has_specs_change = true;
+        } else {
+            return Err(err(
+                "input_error",
+                "prepared worktree contains staged changes outside specs/".into(),
+            ));
+        }
+    }
+    if !has_specs_change {
+        return Err(err(
+            "input_error",
+            "prepared worktree contains no changes under specs/".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn idea_process_status(catalog: &Path, id: &str) -> Result<serde_json::Value, ErrorBody<'static>> {
@@ -3370,6 +3395,41 @@ mod tests {
             Some(false)
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stages_nested_idea_planning_paths_without_unrelated_files() {
+        let root = test_directory("nested-idea-publish");
+        git_in(&root, &["init"]);
+        fs::create_dir_all(root.join("specs/project/topic")).unwrap();
+        fs::write(root.join("specs/project/topic/plan.md"), "plan\n").unwrap();
+        fs::write(root.join("unrelated.md"), "do not publish\n").unwrap();
+
+        stage_idea_planning_subtree(&root).unwrap();
+
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["specs/project/topic/plan.md"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_idea_planning_subtree() {
+        let missing = test_directory("missing-idea-specs");
+        let error = stage_idea_planning_subtree(&missing).unwrap_err();
+        assert_eq!(error.error, "input_error");
+        let _ = fs::remove_dir_all(missing);
+
+        let empty = test_directory("empty-idea-specs");
+        git_in(&empty, &["init"]);
+        fs::create_dir(empty.join("specs")).unwrap();
+        let error = stage_idea_planning_subtree(&empty).unwrap_err();
+        assert_eq!(error.error, "input_error");
+        let _ = fs::remove_dir_all(empty);
     }
 
     #[test]
