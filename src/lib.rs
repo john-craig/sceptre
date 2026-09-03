@@ -817,10 +817,61 @@ fn idea_process_status(catalog: &Path, id: &str) -> Result<serde_json::Value, Er
 fn idea_process_prepare(catalog: &Path, id: &str) -> Result<serde_json::Value, ErrorBody<'static>> {
     validate_idea_id(id)?;
     let mapping: RealRepositoryMapping = read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+    let idea = idea_files(&catalog.join("ideas"))?
+        .into_iter()
+        .find(|(candidate, _)| candidate == id)
+        .map(|(_, path)| path)
+        .ok_or_else(|| err("input_error", format!("idea '{id}' was not found")))?;
+    let idea_text = fs::read_to_string(&idea)
+        .map_err(|_| err("input_error", "cannot read idea record".into()))?;
+    if frontmatter_processed(&idea_text) != Some(false) {
+        return Err(err(
+            "idea_not_pending",
+            format!("idea '{id}' is not pending (processed: false)"),
+        ));
+    }
+    if mapping.upstream.trim().is_empty() || mapping.default_branch.trim().is_empty() {
+        return Err(err(
+            "invalid_repository_mapping",
+            "Grimoire mapping must contain upstream and default_branch".into(),
+        ));
+    }
     let provider = provider_for(&mapping.upstream)?;
     let branch = format!("spec/{id}");
-    let exists = remote_ref_exists(&git_url(&mapping.upstream, false), &branch)?;
+    let git_upstream = git_url(&mapping.upstream, false);
+    let mut exists = remote_ref_exists(&git_upstream, &branch)?;
+    if !exists {
+        let work = temporary_directory(&format!("prepare-{id}"))?;
+        let cleanup = TempCleanup::new(work.clone());
+        let work_str = work
+            .to_str()
+            .ok_or_else(|| err("filesystem_error", "temporary path is not UTF-8".into()))?;
+        run_git(&[
+            "clone",
+            "--branch",
+            &mapping.default_branch,
+            "--single-branch",
+            &git_upstream,
+            work_str,
+        ])?;
+        run_git_in(&work, &["checkout", "-B", &branch])?;
+        run_git_in(&work, &["push", "-u", "origin", &branch])?;
+        if !remote_ref_exists(&git_upstream, &branch)? {
+            return Err(err(
+                "verification_failed",
+                "prepared specification branch was not found".into(),
+            ));
+        }
+        exists = true;
+        drop(cleanup);
+    }
     let prs = provider_prs(&provider, &mapping.upstream, &branch)?;
+    if prs.as_array().map_or(0, Vec::len) > 1 {
+        return Err(err(
+            "provider_error",
+            format!("multiple pull requests match branch '{branch}'"),
+        ));
+    }
     Ok(
         serde_json::json!({"status":if exists {"reused"} else {"prepared"}, "idea_id":id, "branch":branch, "branch_exists":exists, "pull_requests":prs}),
     )
@@ -1021,6 +1072,9 @@ fn integration_candidates(
         let prs = provider_prs(&provider, &repo.upstream, &branch)?;
         if let Some(items) = prs.as_array() {
             for pr in items {
+                if !pr_matches_identity(pr, &repo.upstream, &branch, &repo.mapping.default_branch) {
+                    continue;
+                }
                 if !include_closed
                     && !pr
                         .get("state")
@@ -1130,7 +1184,19 @@ fn integration_merge(
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
     let (manifest, repo, _) = find_repo_spec(manifest_path, catalog, repository, specification)?;
     let provider = provider_for(&repo.upstream)?;
-    let (status, _) = integration_status(&provider, &repo.upstream, number)?;
+    let (status, feedback) = integration_status(&provider, &repo.upstream, number)?;
+    let expected_branch = real_branch_name(&manifest);
+    if !pr_matches_identity(
+        &feedback,
+        &repo.upstream,
+        &expected_branch,
+        &repo.mapping.default_branch,
+    ) {
+        return Err(err(
+            "verification_failed",
+            format!("pull request {number} does not belong to repository '{repository}' or branch '{expected_branch}'"),
+        ));
+    }
     if status == "merged" {
         return Ok(serde_json::json!({"status":"merged","repository":repository,"number":number}));
     }
@@ -1301,7 +1367,7 @@ fn integration_cleanup(
             "--sync-commit is required to prove synchronization".into(),
         ));
     }
-    let (_, repo, _) = find_repo_spec(manifest_path, catalog, repository, specification)?;
+    let (manifest, repo, spec) = find_repo_spec(manifest_path, catalog, repository, specification)?;
     let provider = provider_for(&repo.upstream)?;
     let (status, _) = integration_status(&provider, &repo.upstream, number)?;
     if status != "merged" {
@@ -1309,6 +1375,16 @@ fn integration_cleanup(
             serde_json::json!({"status":"preserved","reason":"integration is not verified complete"}),
         );
     }
+    let grimoire: RealRepositoryMapping = read_catalog_value(&catalog.join("repos/grimoire.json"))?;
+    verify_sync_commit(
+        catalog,
+        &grimoire,
+        &manifest,
+        &repo,
+        &spec,
+        number,
+        sync_commit,
+    )?;
     let branch = format!(
         "feature/{}",
         read_catalog_value::<RealManifest>(manifest_path)?.id
@@ -1323,6 +1399,86 @@ fn integration_cleanup(
     Ok(
         serde_json::json!({"status":"cleaned","branch":branch,"deleted":true,"sync_commit":sync_commit}),
     )
+}
+
+fn verify_sync_commit(
+    _catalog: &Path,
+    grimoire: &RealRepositoryMapping,
+    manifest: &RealManifest,
+    repo: &RealRepository,
+    spec: &RealSpec,
+    number: u64,
+    sync_commit: &str,
+) -> Result<(), ErrorBody<'static>> {
+    if sync_commit.len() != 40 || !sync_commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(err(
+            "verification_failed",
+            "--sync-commit must be the 40-character synchronization commit hash".into(),
+        ));
+    }
+    let work = temporary_directory(&format!("verify-sync-{}", manifest.id))?;
+    let cleanup = TempCleanup::new(work.clone());
+    let grimoire_clone = work.join("grimoire");
+    let source_clone = work.join("source");
+    let grimoire_url = git_url(&grimoire.upstream, false);
+    let source_url = git_url(&repo.upstream, false);
+    run_git(&[
+        "clone",
+        "--no-checkout",
+        &grimoire_url,
+        grimoire_clone.to_str().unwrap(),
+    ])?;
+    run_git_in(
+        &grimoire_clone,
+        &["fetch", "origin", &grimoire.default_branch],
+    )?;
+    let reference = format!("origin/{}", grimoire.default_branch);
+    run_git_in(
+        &grimoire_clone,
+        &["merge-base", "--is-ancestor", sync_commit, &reference],
+    )
+    .map_err(|_| {
+        err(
+            "verification_failed",
+            "sync commit is not on Grimoire default branch".into(),
+        )
+    })?;
+    let destination = format!(
+        "specs/{}/{}/{}/{}/openspec/specs/{}/spec.md",
+        manifest.topic, manifest.project, manifest.id, repo.id, spec.directory
+    );
+    let committed = git_output(
+        &grimoire_clone,
+        &["show", &format!("{sync_commit}:{destination}")],
+    )?;
+    run_git(&[
+        "clone",
+        "--branch",
+        &repo.mapping.default_branch,
+        "--single-branch",
+        &source_url,
+        source_clone.to_str().unwrap(),
+    ])?;
+    let source = fs::read_to_string(
+        source_clone
+            .join("openspec/specs")
+            .join(&spec.directory)
+            .join("spec.md"),
+    )
+    .map_err(|_| {
+        err(
+            "verification_failed",
+            "merged source specification is unavailable".into(),
+        )
+    })?;
+    if committed != source {
+        return Err(err(
+            "verification_failed",
+            format!("sync commit does not contain the merged specification for PR {number}"),
+        ));
+    }
+    drop(cleanup);
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2022,16 +2178,31 @@ fn provider_prs(
         )?,
         Provider::Gitea => command_output(
             "tea",
-            &["pr", "list", "--repo", upstream, "--state", "all"],
+            &[
+                "pr", "list", "--repo", upstream, "--state", "all", "--output", "json",
+            ],
             "list pull requests",
         )?,
     };
-    serde_json::from_str(&output).map_err(|_| {
+    let value: serde_json::Value = serde_json::from_str(&output).map_err(|_| {
         err(
             "provider_error",
             "provider returned invalid pull-request JSON".into(),
         )
-    })
+    })?;
+    let Some(items) = value.as_array() else {
+        return Err(err(
+            "provider_error",
+            "provider returned non-array pull-request JSON".into(),
+        ));
+    };
+    Ok(serde_json::Value::Array(
+        items
+            .iter()
+            .filter(|pr| pr_branch(pr) == Some(branch))
+            .cloned()
+            .collect(),
+    ))
 }
 
 fn provider_feedback(
@@ -2050,13 +2221,13 @@ fn provider_feedback(
                 "--repo",
                 upstream,
                 "--json",
-                "number,state,reviews,comments,mergeCommit",
+                "number,state,reviews,comments,mergeCommit,headRefName,baseRefName,repository,title,body",
             ],
             "read pull-request feedback",
         )?,
         Provider::Gitea => command_output(
             "tea",
-            &["pr", "show", &number, "--repo", upstream],
+            &["pr", "show", &number, "--repo", upstream, "--output", "json"],
             "read pull-request feedback",
         )?,
     };
@@ -2067,6 +2238,56 @@ fn provider_feedback(
         )
     })?;
     Ok(bound_feedback(value))
+}
+
+fn pr_branch(pr: &serde_json::Value) -> Option<&str> {
+    ["headRefName", "head", "head_branch", "source_branch"]
+        .iter()
+        .find_map(|key| pr.get(*key).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            pr.get("head")
+                .and_then(|head| head.get("ref").or_else(|| head.get("name")))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn pr_matches_identity(pr: &serde_json::Value, upstream: &str, branch: &str, base: &str) -> bool {
+    let repository_matches = ["repository", "repo", "baseRepository", "repository_url"]
+        .iter()
+        .filter_map(|key| pr.get(*key).and_then(serde_json::Value::as_str))
+        .all(|value| repository_matches(value, upstream));
+    let branch_matches = pr_branch(pr) == Some(branch);
+    let base_matches = ["baseRefName", "base", "base_branch"]
+        .iter()
+        .find_map(|key| pr.get(*key).and_then(serde_json::Value::as_str))
+        .is_none_or(|value| value == base);
+    repository_matches && branch_matches && base_matches
+}
+
+fn repository_identity(value: &str) -> String {
+    value
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .replace("https://", "")
+        .replace("http://", "")
+        .replace("git@", "")
+        .replace(':', "/")
+}
+
+fn repository_matches(value: &str, upstream: &str) -> bool {
+    let actual = repository_identity(value);
+    let expected = repository_identity(upstream);
+    actual == expected || repository_path(&actual) == repository_path(&expected)
+}
+
+fn repository_path(value: &str) -> Option<&str> {
+    let (first, rest) = value.split_once('/')?;
+    if rest.contains('/') {
+        let _ = first;
+        Some(rest)
+    } else {
+        Some(value)
+    }
 }
 
 fn bound_feedback(mut value: serde_json::Value) -> serde_json::Value {
@@ -2149,7 +2370,20 @@ fn publish_repository(
     let branch = format!("feature/{specset_id}");
     run_git_in(worktree, &["checkout", "-B", &branch])?;
     run_git_in(worktree, &["add", "openspec/specs"])?;
-    let _ = run_git_in(worktree, &["commit", "-m", message]);
+    let changed = Command::new("git")
+        .current_dir(worktree)
+        .args(["diff", "--cached", "--quiet"])
+        .output()
+        .map(|output| !output.status.success())
+        .map_err(|_| {
+            err(
+                "git_error",
+                "could not inspect staged implementation changes".into(),
+            )
+        })?;
+    if changed {
+        run_git_in(worktree, &["commit", "-m", message])?;
+    }
     run_git_in(worktree, &["push", "-u", "origin", &branch])?;
     let provider = provider_for(upstream)?;
     let prs = provider_prs(&provider, upstream, &branch)?;
@@ -3150,6 +3384,77 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.error, "input_error");
+    }
+
+    #[test]
+    fn rejects_arbitrary_synchronization_hashes_before_remote_operations() {
+        let root = test_directory("sync-hash");
+        let error = verify_sync_commit(
+            &root,
+            &RealRepositoryMapping {
+                id: "grimoire".into(),
+                upstream: "https://github.com/a/grimoire".into(),
+                upstream_created: true,
+                default_branch: "main".into(),
+            },
+            &RealManifest {
+                id: "demo".into(),
+                project: "project".into(),
+                topic: "topic".into(),
+                repositories: vec![],
+                implementation_order: vec![],
+                spec_dependencies: serde_yaml::Value::Null,
+            },
+            &RealRepository {
+                id: "repo".into(),
+                mapping: RealRepositoryMapping {
+                    id: "repo".into(),
+                    upstream: "https://github.com/a/repo".into(),
+                    upstream_created: true,
+                    default_branch: "main".into(),
+                },
+                upstream: "https://github.com/a/repo".into(),
+                specs: vec![],
+            },
+            &RealSpec {
+                directory: "agent-spec".into(),
+                agent: "agent".into(),
+                dependencies: vec![],
+                source: root.clone(),
+            },
+            1,
+            &"z".repeat(40),
+        )
+        .unwrap_err();
+        assert_eq!(error.error, "verification_failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_identity_requires_matching_branch_and_repository() {
+        let matching = serde_json::json!({
+            "headRefName": "feature/demo",
+            "baseRefName": "main",
+            "repository": "owner/repo"
+        });
+        assert!(pr_matches_identity(
+            &matching,
+            "https://github.com/owner/repo",
+            "feature/demo",
+            "main"
+        ));
+        assert!(!pr_matches_identity(
+            &serde_json::json!({"headRefName":"feature/other","repository":"owner/repo"}),
+            "https://github.com/owner/repo",
+            "feature/demo",
+            "main"
+        ));
+        assert!(!pr_matches_identity(
+            &serde_json::json!({"headRefName":"feature/demo","repository":"owner/other"}),
+            "https://github.com/owner/repo",
+            "feature/demo",
+            "main"
+        ));
     }
 
     fn test_directory(label: &str) -> std::path::PathBuf {

@@ -142,4 +142,8 @@ worktrees, or deployment. Idea records are discovered under nested
 `ideas/**/IDEA.md` paths. Integration source and destination paths are resolved
 from the manifest and the real Grimoire layout; no synchronization destination
 argument is accepted. Git uses SSH URLs by default, while `gh` and `tea` use
-their configured credentials. Provider and Git diagnostics are redacted.
+their configured credentials. `idea-process prepare` validates a pending idea,
+creates or reuses `spec/<idea-id>` from the configured default branch, and
+verifies the remote branch before returning. Integration cleanup accepts only a
+verified synchronization commit from the Grimoire default branch. Provider and
+Git diagnostics are redacted.
