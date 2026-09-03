@@ -957,6 +957,7 @@ fn upsert_pr(
     body: &str,
     prs: serde_json::Value,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let repository = provider_repository(provider, upstream)?;
     let matches: Vec<&serde_json::Value> = prs
         .as_array()
         .map(|items| {
@@ -986,11 +987,26 @@ fn upsert_pr(
                     "matching pull request has no number".into(),
                 )
             })?;
-        command(
-            provider.tool(),
-            &["pr", "edit", &number.to_string(), "--title", title],
-            "update pull request",
-        )?;
+        match provider {
+            Provider::Github => command(
+                "gh",
+                &["pr", "edit", &number.to_string(), "--title", title],
+                "update pull request",
+            )?,
+            Provider::Gitea => command(
+                "tea",
+                &[
+                    "pr",
+                    "edit",
+                    &number.to_string(),
+                    "--repo",
+                    &repository,
+                    "--title",
+                    title,
+                ],
+                "update pull request",
+            )?,
+        }
         return Ok(serde_json::json!({"number":number,"status":"updated"}));
     }
     let base = if default_branch.is_empty() {
@@ -1013,7 +1029,7 @@ fn upsert_pr(
                 "pr",
                 "create",
                 "--repo",
-                upstream,
+                &repository,
                 "--head",
                 branch,
                 "--base",
@@ -1239,7 +1255,13 @@ fn integration_merge(
         )?,
         Provider::Gitea => command(
             "tea",
-            &["pr", "merge", &n, "--repo", &repo.upstream],
+            &[
+                "pr",
+                "merge",
+                &n,
+                "--repo",
+                &provider_repository(&provider, &repo.upstream)?,
+            ],
             "merge pull request",
         )?,
     }
@@ -2184,6 +2206,7 @@ fn provider_prs(
     upstream: &str,
     branch: &str,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let repository = provider_repository(provider, upstream)?;
     let output = match provider {
         Provider::Github => command_output(
             "gh",
@@ -2204,7 +2227,14 @@ fn provider_prs(
         Provider::Gitea => command_output(
             "tea",
             &[
-                "pr", "list", "--repo", upstream, "--state", "all", "--output", "json",
+                "pr",
+                "list",
+                "--repo",
+                &repository,
+                "--state",
+                "all",
+                "--output",
+                "json",
             ],
             "list pull requests",
         )?,
@@ -2236,6 +2266,7 @@ fn provider_feedback(
     number: u64,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
     let number = number.to_string();
+    let repository = provider_repository(provider, upstream)?;
     let output = match provider {
         Provider::Github => command_output(
             "gh",
@@ -2252,7 +2283,7 @@ fn provider_feedback(
         )?,
         Provider::Gitea => command_output(
             "tea",
-            &["pr", "show", &number, "--repo", upstream, "--output", "json"],
+            &["pr", "show", &number, "--repo", &repository, "--output", "json"],
             "read pull-request feedback",
         )?,
     };
@@ -2411,6 +2442,7 @@ fn publish_repository(
     }
     run_git_in(worktree, &["push", "-u", "origin", &branch])?;
     let provider = provider_for(upstream)?;
+    let provider_repository = provider_repository(&provider, upstream)?;
     let prs = provider_prs(&provider, upstream, &branch)?;
     if prs.as_array().map_or(0, Vec::len) > 1 {
         return Err(err(
@@ -2426,11 +2458,26 @@ fn publish_repository(
     let pr = if let Some(number) = existing {
         let n = number.to_string();
         if let Some(title) = title {
-            command(
-                provider.tool(),
-                &["pr", "edit", &n, "--title", title],
-                "update pull request",
-            )?;
+            match provider {
+                Provider::Github => command(
+                    "gh",
+                    &["pr", "edit", &n, "--title", title],
+                    "update pull request",
+                )?,
+                Provider::Gitea => command(
+                    "tea",
+                    &[
+                        "pr",
+                        "edit",
+                        &n,
+                        "--repo",
+                        &provider_repository,
+                        "--title",
+                        title,
+                    ],
+                    "update pull request",
+                )?,
+            }
         }
         serde_json::json!({"number": number, "status": "updated"})
     } else {
@@ -2455,7 +2502,7 @@ fn publish_repository(
                     "pr",
                     "create",
                     "--repo",
-                    upstream,
+                    &provider_repository,
                     "--head",
                     &branch,
                     "--base",
@@ -2532,7 +2579,7 @@ fn create_repository(
             ),
         ));
     }
-    let exists = provider_exists(&provider, &definition.upstream);
+    let exists = provider_exists(&provider, &definition.upstream)?;
     if exists {
         verify_provider(&provider, &definition)?;
         if clone {
@@ -2958,15 +3005,11 @@ fn resolve_template(path: &Path, id: &str) -> Result<Template, ErrorBody<'static
 }
 
 fn provider_for(url: &str) -> Result<Provider, ErrorBody<'static>> {
-    let host = url
-        .split("//")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let host = upstream_host(url).unwrap_or_default().to_ascii_lowercase();
     if host == "github.com" || host.ends_with(".github.com") {
         Ok(Provider::Github)
     } else if host == "gitea.com" || host.contains("gitea") {
+        gitea_repository_identifier(url)?;
         Ok(Provider::Gitea)
     } else {
         Err(err(
@@ -2977,6 +3020,52 @@ fn provider_for(url: &str) -> Result<Provider, ErrorBody<'static>> {
             ),
         ))
     }
+}
+
+fn upstream_host(upstream: &str) -> Option<&str> {
+    let value = upstream.trim();
+    if let Some((_, rest)) = value.split_once("//") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return Some(host.split(':').next().unwrap_or(host));
+    }
+    let (authority, _) = value.split_once(':')?;
+    Some(
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host),
+    )
+}
+
+fn provider_repository(provider: &Provider, upstream: &str) -> Result<String, ErrorBody<'static>> {
+    match provider {
+        Provider::Github => Ok(upstream.to_owned()),
+        Provider::Gitea => gitea_repository_identifier(upstream),
+    }
+}
+
+fn gitea_repository_identifier(upstream: &str) -> Result<String, ErrorBody<'static>> {
+    let value = upstream.trim();
+    let path = if let Some((_, rest)) = value.split_once("//") {
+        rest.split_once('/').map_or("", |(_, path)| path)
+    } else {
+        value.split_once(':').map_or("", |(_, path)| path)
+    };
+    let components: Vec<&str> = path
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.len() != 2 {
+        return Err(err(
+            "input_error",
+            "Gitea upstream must identify an owner and repository".into(),
+        ));
+    }
+    Ok(format!("{}/{}", components[0], components[1]))
 }
 
 fn git_url(upstream: &str, use_https: bool) -> String {
@@ -3000,16 +3089,17 @@ fn tool_available(tool: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
-fn provider_exists(provider: &Provider, upstream: &str) -> bool {
+fn provider_exists(provider: &Provider, upstream: &str) -> Result<bool, ErrorBody<'static>> {
+    let repository = provider_repository(provider, upstream)?;
     let args = match provider {
         Provider::Github => vec!["repo", "view", upstream],
-        Provider::Gitea => vec!["repo", "show", upstream],
+        Provider::Gitea => vec!["repo", "show", &repository],
     };
-    Command::new(provider.tool())
+    Ok(Command::new(provider.tool())
         .args(args)
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 fn create_remote(
     provider: &Provider,
@@ -3021,9 +3111,10 @@ fn create_remote(
         Visibility::Private => "--private",
         Visibility::Internal => "--internal",
     };
+    let repository = provider_repository(provider, &definition.upstream)?;
     let args = match provider {
         Provider::Github => vec!["repo", "create", &definition.upstream, visibility],
-        Provider::Gitea => vec!["repo", "create", &definition.upstream, visibility],
+        Provider::Gitea => vec!["repo", "create", &repository, visibility],
     };
     let _ = work;
     command(provider.tool(), &args, "create upstream repository")
@@ -3032,7 +3123,7 @@ fn verify_provider(
     provider: &Provider,
     definition: &RepositoryDefinition,
 ) -> Result<(), ErrorBody<'static>> {
-    if provider_exists(provider, &definition.upstream) {
+    if provider_exists(provider, &definition.upstream)? {
         Ok(())
     } else {
         Err(err(
@@ -3159,6 +3250,35 @@ mod tests {
     #[test]
     fn rejects_unknown_provider() {
         assert!(provider_for("https://gitlab.com/a/b").is_err());
+    }
+
+    #[test]
+    fn normalizes_gitea_upstreams_for_provider_operations() {
+        for upstream in [
+            "https://gitea.example/owner/repository",
+            "https://gitea.example/owner/repository.git",
+            "ssh://git@gitea.example:2222/owner/repository.git",
+            "git@gitea.example:owner/repository.git",
+        ] {
+            assert_eq!(
+                gitea_repository_identifier(upstream).unwrap(),
+                "owner/repository"
+            );
+            assert_eq!(provider_for(upstream).unwrap(), Provider::Gitea);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_gitea_upstreams_without_exposing_input() {
+        for upstream in [
+            "https://gitea.example/owner",
+            "https://gitea.example/owner/repository/extra",
+            "https://gitea.example/owner:repository",
+        ] {
+            let error = gitea_repository_identifier(upstream).unwrap_err();
+            assert_eq!(error.error, "input_error");
+            assert!(!error.message.contains(upstream));
+        }
     }
     #[test]
     fn missing_template_is_reported() {

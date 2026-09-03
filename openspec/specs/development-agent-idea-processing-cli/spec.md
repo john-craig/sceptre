@@ -51,7 +51,9 @@ service was retried.
 The CLI SHALL select Git hosting operations from the configured remote and
 shall use the available provider tooling or API for that remote. It SHALL
 support the GitHub and Gitea providers used by the workflow without embedding
-credentials in arguments, source, or output.
+credentials in arguments, source, or output. For Gitea operations, Sceptre SHALL
+pass the provider's canonical `owner/repository` identifier to `tea` while
+retaining the configured or derived SSH URL for Git transport operations.
 
 #### Scenario: GitHub Grimoire is configured
 
@@ -64,6 +66,20 @@ credentials in arguments, source, or output.
 - **WHEN** the configured provider rejects authentication
 - **THEN** Sceptre SHALL return a non-zero result with redacted actionable
   diagnostics
+
+#### Scenario: Gitea upstream uses a full repository URL
+
+- **WHEN** the configured Gitea upstream is
+  `https://gitea.example/owner/repository`
+- **THEN** Sceptre SHALL invoke `tea` with `owner/repository` as its repository
+  argument and SHALL continue to use the SSH transport URL for Git operations
+
+#### Scenario: Gitea upstream cannot identify an owner and repository
+
+- **WHEN** a Gitea upstream cannot be normalized to exactly an owner and
+  repository path
+- **THEN** Sceptre SHALL return a structured validation error before invoking
+  `tea` or mutating a remote repository
 
 ### Requirement: The CLI does not own worker orchestration
 

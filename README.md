@@ -153,3 +153,8 @@ under the repository-root `specs/` directory, including nested layouts such as
 `specs/<project>/<topic>/...`. It stages only that subtree and returns a
 structured input error without pushing or touching a pull request when the
 subtree is missing or has no changes.
+
+For Gitea, the configured upstream remains the Git transport URL, while provider
+commands receive its normalized `owner/repository` identifier. HTTPS,
+`ssh://`, and SCP-style upstreams are accepted, including custom SSH ports and
+an optional `.git` suffix.
