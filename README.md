@@ -163,3 +163,5 @@ an optional `.git` suffix.
 arrays. Each entry contains `author`, `body`, `timestamp`, `type`, and `state`;
 empty arrays are returned when no feedback exists. Content is bounded and the
 `feedback_truncated` boolean indicates omitted comments or review content.
+Gitea's one-record JSON array response is normalized to this same shape; empty
+or ambiguous arrays return a structured provider error.

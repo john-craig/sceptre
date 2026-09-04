@@ -2293,6 +2293,31 @@ fn provider_feedback(
             "provider returned invalid feedback JSON".into(),
         )
     })?;
+    normalize_provider_feedback(value, provider)
+}
+
+fn normalize_provider_feedback(
+    value: serde_json::Value,
+    provider: &Provider,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    let value = match (provider, value) {
+        (Provider::Gitea, serde_json::Value::Array(mut records)) => {
+            if records.is_empty() {
+                return Err(err(
+                    "provider_error",
+                    "Gitea pull request was not found".into(),
+                ));
+            }
+            if records.len() != 1 {
+                return Err(err(
+                    "provider_error",
+                    "Gitea returned an ambiguous pull-request response".into(),
+                ));
+            }
+            records.remove(0)
+        }
+        (_, value) => value,
+    };
     normalize_feedback(value)
 }
 
@@ -3557,6 +3582,31 @@ mod tests {
         let error =
             normalize_feedback(serde_json::json!({"comments": "not-an-array"})).unwrap_err();
         assert_eq!(error.error, "provider_error");
+    }
+
+    #[test]
+    fn accepts_one_record_gitea_feedback_arrays() {
+        let record = serde_json::json!({
+            "number": 1,
+            "comments": [{"user": {"login": "reviewer"}, "body": "Please revise"}],
+            "reviews": [{"user": {"login": "reviewer"}, "state": "REQUESTED_CHANGES"}]
+        });
+        let object = normalize_provider_feedback(record.clone(), &Provider::Gitea).unwrap();
+        let array =
+            normalize_provider_feedback(serde_json::Value::Array(vec![record]), &Provider::Gitea)
+                .unwrap();
+        assert_eq!(array, object);
+    }
+
+    #[test]
+    fn rejects_empty_or_ambiguous_gitea_feedback_arrays() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([{"number": 1}, {"number": 2}]),
+        ] {
+            let error = normalize_provider_feedback(value, &Provider::Gitea).unwrap_err();
+            assert_eq!(error.error, "provider_error");
+        }
     }
 
     #[test]
