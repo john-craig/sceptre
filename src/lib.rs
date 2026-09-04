@@ -730,7 +730,7 @@ fn run_idea_process(action: IdeaProcessAction) -> Result<serde_json::Value, Erro
             let provider = provider_for(&upstream)?;
             Ok(
                 serde_json::json!({"status":"ok", "upstream":redact_remote(&upstream), "number":number,
-                "feedback":bound_feedback(provider_feedback(&provider, &upstream, number)?)}),
+                "feedback":provider_feedback(&provider, &upstream, number)?}),
             )
         }
         IdeaProcessAction::Pending { catalog } => {
@@ -2293,7 +2293,7 @@ fn provider_feedback(
             "provider returned invalid feedback JSON".into(),
         )
     })?;
-    Ok(bound_feedback(value))
+    normalize_feedback(value)
 }
 
 fn pr_branch(pr: &serde_json::Value) -> Option<&str> {
@@ -2346,18 +2346,89 @@ fn repository_path(value: &str) -> Option<&str> {
     }
 }
 
-fn bound_feedback(mut value: serde_json::Value) -> serde_json::Value {
-    if let Some(object) = value.as_object_mut() {
-        for key in ["reviews", "comments"] {
-            if let Some(items) = object
-                .get_mut(key)
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                items.truncate(50);
+fn normalize_feedback(value: serde_json::Value) -> Result<serde_json::Value, ErrorBody<'static>> {
+    const MAX_ITEMS: usize = 50;
+    const MAX_BODY_LENGTH: usize = 10_000;
+    let mut object = value.as_object().cloned().ok_or_else(|| {
+        err(
+            "provider_error",
+            "provider feedback must be a JSON object".into(),
+        )
+    })?;
+    let mut truncated = false;
+    for (key, kind) in [("comments", "comment"), ("reviews", "review")] {
+        let source = match object.remove(key) {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items,
+            Some(_) => {
+                return Err(err(
+                    "provider_error",
+                    format!("provider feedback field '{key}' must be an array"),
+                ))
             }
+        };
+        if source.len() > MAX_ITEMS {
+            truncated = true;
         }
+        let mut normalized = Vec::new();
+        for item in source.into_iter().take(MAX_ITEMS) {
+            let item = item.as_object().ok_or_else(|| {
+                err(
+                    "provider_error",
+                    format!("provider feedback {kind} must be an object"),
+                )
+            })?;
+            let author = ["author", "user", "creator"]
+                .iter()
+                .find_map(|field| feedback_identity(item.get(*field)))
+                .or_else(|| feedback_identity(item.get("login")))
+                .unwrap_or_default();
+            let body = ["body", "comment", "text"]
+                .iter()
+                .find_map(|field| item.get(*field).and_then(serde_json::Value::as_str))
+                .unwrap_or("");
+            let mut body = body.to_owned();
+            if body.len() > MAX_BODY_LENGTH {
+                body = body.chars().take(MAX_BODY_LENGTH).collect();
+                truncated = true;
+            }
+            let timestamp = ["createdAt", "submittedAt", "created", "timestamp"]
+                .iter()
+                .find_map(|field| item.get(*field).and_then(serde_json::Value::as_str))
+                .unwrap_or("");
+            let state = item
+                .get("state")
+                .or_else(|| item.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            normalized.push(serde_json::json!({
+                "author": author,
+                "body": body,
+                "timestamp": timestamp,
+                "type": kind,
+                "state": state,
+            }));
+        }
+        object.insert(key.to_owned(), serde_json::Value::Array(normalized));
     }
-    value
+    object.insert(
+        "feedback_truncated".into(),
+        serde_json::Value::Bool(truncated),
+    );
+    Ok(serde_json::Value::Object(object))
+}
+
+fn feedback_identity(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| {
+        value.as_str().map(str::to_owned).or_else(|| {
+            ["login", "username", "name"].iter().find_map(|field| {
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+    })
 }
 
 #[cfg(any())]
@@ -3448,6 +3519,44 @@ mod tests {
             redact_remote("https://token:secret@example.test/a/b"),
             "https://[redacted]@example.test/a/b"
         );
+    }
+
+    #[test]
+    fn normalizes_feedback_comments_and_reviews() {
+        let feedback = normalize_feedback(serde_json::json!({
+            "number": 4,
+            "comments": [{"author": {"login": "reviewer"}, "body": "Please revise", "createdAt": "today"}],
+            "reviews": [{"user": {"login": "reviewer"}, "body": "Changes needed", "state": "CHANGES_REQUESTED", "submittedAt": "yesterday"}]
+        })).unwrap();
+        assert_eq!(feedback["comments"][0]["author"], "reviewer");
+        assert_eq!(feedback["comments"][0]["type"], "comment");
+        assert_eq!(feedback["reviews"][0]["state"], "CHANGES_REQUESTED");
+        assert_eq!(feedback["reviews"][0]["type"], "review");
+        assert_eq!(feedback["feedback_truncated"], false);
+    }
+
+    #[test]
+    fn feedback_defaults_to_empty_collections_and_reports_truncation() {
+        let empty = normalize_feedback(serde_json::json!({"number": 4})).unwrap();
+        assert_eq!(empty["comments"], serde_json::json!([]));
+        assert_eq!(empty["reviews"], serde_json::json!([]));
+
+        let oversized = normalize_feedback(serde_json::json!({
+            "comments": [{"body": "x".repeat(10_001)}]
+        }))
+        .unwrap();
+        assert_eq!(
+            oversized["comments"][0]["body"].as_str().unwrap().len(),
+            10_000
+        );
+        assert_eq!(oversized["feedback_truncated"], true);
+    }
+
+    #[test]
+    fn malformed_feedback_is_a_structured_provider_error() {
+        let error =
+            normalize_feedback(serde_json::json!({"comments": "not-an-array"})).unwrap_err();
+        assert_eq!(error.error, "provider_error");
     }
 
     #[test]

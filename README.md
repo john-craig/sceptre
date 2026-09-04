@@ -158,3 +158,8 @@ For Gitea, the configured upstream remains the Git transport URL, while provider
 commands receive its normalized `owner/repository` identifier. HTTPS,
 `ssh://`, and SCP-style upstreams are accepted, including custom SSH ports and
 an optional `.git` suffix.
+
+`idea-process feedback` returns provider-independent `comments` and `reviews`
+arrays. Each entry contains `author`, `body`, `timestamp`, `type`, and `state`;
+empty arrays are returned when no feedback exists. Content is bounded and the
+`feedback_truncated` boolean indicates omitted comments or review content.
