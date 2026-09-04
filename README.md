@@ -165,3 +165,6 @@ empty arrays are returned when no feedback exists. Content is bounded and the
 `feedback_truncated` boolean indicates omitted comments or review content.
 Gitea's one-record JSON array response is normalized to this same shape; empty
 or ambiguous arrays return a structured provider error.
+For Gitea, comments and reviews are retrieved through the read-only structured
+discussion query using the configured `tea` credentials; discussion failures are
+reported rather than treated as empty feedback.

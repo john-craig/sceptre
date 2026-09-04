@@ -2293,14 +2293,48 @@ fn provider_feedback(
             "provider returned invalid feedback JSON".into(),
         )
     })?;
-    normalize_provider_feedback(value, provider)
+    if *provider == Provider::Gitea {
+        let mut metadata = unwrap_provider_feedback(value, provider)?;
+        let discussion_output = command_output(
+            "tea",
+            &[
+                "pulls",
+                &number,
+                "--repo",
+                &repository,
+                "--comments",
+                "--output",
+                "json",
+            ],
+            "read pull-request discussion",
+        )?;
+        let discussion: serde_json::Value =
+            serde_json::from_str(&discussion_output).map_err(|_| {
+                err(
+                    "provider_error",
+                    "Gitea returned invalid structured pull-request discussion".into(),
+                )
+            })?;
+        merge_gitea_discussion(&mut metadata, discussion)?;
+        normalize_feedback(metadata)
+    } else {
+        normalize_provider_feedback(value, provider)
+    }
 }
 
 fn normalize_provider_feedback(
     value: serde_json::Value,
     provider: &Provider,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
-    let value = match (provider, value) {
+    let value = unwrap_provider_feedback(value, provider)?;
+    normalize_feedback(value)
+}
+
+fn unwrap_provider_feedback(
+    value: serde_json::Value,
+    provider: &Provider,
+) -> Result<serde_json::Value, ErrorBody<'static>> {
+    Ok(match (provider, value) {
         (Provider::Gitea, serde_json::Value::Array(mut records)) => {
             if records.is_empty() {
                 return Err(err(
@@ -2317,8 +2351,45 @@ fn normalize_provider_feedback(
             records.remove(0)
         }
         (_, value) => value,
+    })
+}
+
+fn merge_gitea_discussion(
+    metadata: &mut serde_json::Value,
+    discussion: serde_json::Value,
+) -> Result<(), ErrorBody<'static>> {
+    let discussion = match discussion {
+        serde_json::Value::Array(items) => serde_json::json!({"comments": items}),
+        serde_json::Value::Object(object) => serde_json::Value::Object(object),
+        _ => {
+            return Err(err(
+                "provider_error",
+                "Gitea discussion response must be a JSON object or array".into(),
+            ))
+        }
     };
-    normalize_feedback(value)
+    let Some(metadata) = metadata.as_object_mut() else {
+        return Err(err(
+            "provider_error",
+            "normalized Gitea metadata must be a JSON object".into(),
+        ));
+    };
+    let Some(discussion) = discussion.as_object() else {
+        unreachable!();
+    };
+    for key in ["comments", "reviews"] {
+        let Some(items) = discussion.get(key) else {
+            continue;
+        };
+        if !items.is_array() {
+            return Err(err(
+                "provider_error",
+                format!("Gitea discussion field '{key}' must be an array"),
+            ));
+        }
+        metadata.insert(key.into(), items.clone());
+    }
+    Ok(())
 }
 
 fn pr_branch(pr: &serde_json::Value) -> Option<&str> {
@@ -3607,6 +3678,19 @@ mod tests {
             let error = normalize_provider_feedback(value, &Provider::Gitea).unwrap_err();
             assert_eq!(error.error, "provider_error");
         }
+    }
+
+    #[test]
+    fn merges_structured_gitea_discussion_into_metadata() {
+        let mut metadata = serde_json::json!({"number": 1, "comments": [], "reviews": []});
+        merge_gitea_discussion(
+            &mut metadata,
+            serde_json::json!([{"user": {"login": "reviewer"}, "body": "Please revise"}]),
+        )
+        .unwrap();
+        let normalized = normalize_feedback(metadata).unwrap();
+        assert_eq!(normalized["comments"][0]["author"], "reviewer");
+        assert_eq!(normalized["comments"][0]["body"], "Please revise");
     }
 
     #[test]

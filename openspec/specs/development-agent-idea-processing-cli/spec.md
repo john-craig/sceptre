@@ -16,6 +16,9 @@ general comments and review decisions, using a stable provider-independent
 structure.
 The operation SHALL accept the array-shaped pull-request response emitted by
 the supported Gitea `tea` client and normalize it before extracting feedback.
+For Gitea, comments and review decisions SHALL be obtained through a structured
+provider response rather than metadata-only pull-request output or unbounded
+human-readable output.
 
 #### Scenario: Service discovers pending ideas
 
@@ -43,6 +46,20 @@ the supported Gitea `tea` client and normalize it before extracting feedback.
   feedback
 - **THEN** Sceptre SHALL return a structured provider error indicating that the
   target pull request could not be found
+
+#### Scenario: Gitea contains a general pull-request comment
+
+- **WHEN** the feedback operation reads a Gitea pull request containing a
+  general comment
+- **THEN** the result SHALL include that comment's author, body, timestamp, and
+  provider-independent comment type
+
+#### Scenario: Structured Gitea feedback retrieval fails
+
+- **WHEN** the configured Gitea provider cannot return structured comments or
+  review decisions
+- **THEN** Sceptre SHALL return a non-zero result with a redacted actionable
+  provider error and SHALL NOT claim that feedback is absent
 
 #### Scenario: Pull request has a general comment
 
