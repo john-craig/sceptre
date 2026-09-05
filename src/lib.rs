@@ -295,6 +295,8 @@ enum SpecsetAction {
         input: SpecsetInput,
         #[arg(long)]
         worktree: PathBuf,
+        #[arg(long = "implementation-path", value_name = "PATH")]
+        implementation_paths: Vec<PathBuf>,
         #[arg(long)]
         message: String,
         #[arg(long)]
@@ -648,6 +650,17 @@ fn run_specset(action: SpecsetAction) -> Result<serde_json::Value, ErrorBody<'st
         })
         .unwrap());
     }
+    let implementation_paths = match &action {
+        SpecsetAction::Publish {
+            worktree,
+            implementation_paths,
+            ..
+        } => Some(validate_implementation_paths(
+            worktree,
+            implementation_paths,
+        )?),
+        _ => None,
+    };
     let target = next_real_target(&state, |repo, spec| {
         merged_for_spec(
             &provider_for(&repo.mapping.upstream)?,
@@ -710,7 +723,14 @@ fn run_specset(action: SpecsetAction) -> Result<serde_json::Value, ErrorBody<'st
             let Some(target) = target else {
                 return Ok(serde_json::json!({"status":"complete", "specset_id":manifest.id}));
             };
-            publish_real(&state, &worktree, &target, &message, title.as_deref())
+            publish_real(
+                &state,
+                &worktree,
+                &target,
+                implementation_paths.as_deref().unwrap_or_default(),
+                &message,
+                title.as_deref(),
+            )
         }
         SpecsetAction::Feedback { .. } => unreachable!(),
     }
@@ -1928,6 +1948,7 @@ fn publish_real(
     state: &RealState,
     worktree: &Path,
     target: &SpecTarget,
+    implementation_paths: &[PathBuf],
     message: &str,
     title: Option<&str>,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
@@ -1943,6 +1964,7 @@ fn publish_real(
         &repo.mapping.default_branch,
         worktree,
         target,
+        implementation_paths,
         message,
         title,
     )
@@ -2587,12 +2609,13 @@ fn publish_repository(
     default_branch: &str,
     worktree: &Path,
     target: &SpecTarget,
+    implementation_paths: &[PathBuf],
     message: &str,
     title: Option<&str>,
 ) -> Result<serde_json::Value, ErrorBody<'static>> {
     let branch = format!("feature/{specset_id}");
     run_git_in(worktree, &["checkout", "-B", &branch])?;
-    run_git_in(worktree, &["add", "openspec/specs"])?;
+    stage_publish_paths(worktree, implementation_paths)?;
     let changed = Command::new("git")
         .current_dir(worktree)
         .args(["diff", "--cached", "--quiet"])
@@ -2687,6 +2710,94 @@ fn publish_repository(
     Ok(
         serde_json::json!({"status":"published", "specset_id":specset_id, "repository":repository, "target":target, "branch":branch, "pull_request":pr}),
     )
+}
+
+fn validate_implementation_paths(
+    worktree: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, ErrorBody<'static>> {
+    if paths.is_empty() {
+        return Err(err(
+            "input_error",
+            "at least one implementation path is required".into(),
+        ));
+    }
+    let root = fs::canonicalize(worktree).map_err(|_| {
+        err(
+            "input_error",
+            "implementation worktree does not exist".into(),
+        )
+    })?;
+    let mut validated = Vec::new();
+    for path in paths {
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(err(
+                "input_error",
+                "implementation paths must remain inside the worktree".into(),
+            ));
+        }
+        let normalized = path
+            .components()
+            .fold(PathBuf::new(), |mut result, component| {
+                if let std::path::Component::Normal(part) = component {
+                    result.push(part);
+                }
+                result
+            });
+        if normalized.as_os_str().is_empty() {
+            return Err(err(
+                "input_error",
+                "implementation path must not be empty".into(),
+            ));
+        }
+        let candidate = worktree.join(&normalized);
+        let valid_location = if candidate.exists() || fs::symlink_metadata(&candidate).is_ok() {
+            fs::canonicalize(&candidate)
+                .map(|resolved| resolved.starts_with(&root))
+                .unwrap_or(false)
+        } else {
+            let tracked = normalized.to_str().is_some_and(|path| {
+                Command::new("git")
+                    .current_dir(worktree)
+                    .args(["ls-files", "--error-unmatch", "--", path])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            });
+            tracked
+        };
+        if !valid_location {
+            return Err(err(
+                "input_error",
+                "implementation path is missing or outside the worktree".into(),
+            ));
+        }
+        if !validated.contains(&normalized) {
+            validated.push(normalized);
+        }
+    }
+    Ok(validated)
+}
+
+fn stage_publish_paths(
+    worktree: &Path,
+    implementation_paths: &[PathBuf],
+) -> Result<(), ErrorBody<'static>> {
+    let mut arguments = vec![
+        "add".to_string(),
+        "--".to_string(),
+        "openspec/specs".to_string(),
+    ];
+    arguments.extend(
+        implementation_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    let references = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    run_git_in(worktree, &references)
 }
 
 fn command_output(
@@ -3403,6 +3514,7 @@ fn err<'a>(error: &'a str, message: String) -> ErrorBody<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn selects_provider_from_upstream() {
         assert_eq!(
@@ -3778,6 +3890,172 @@ mod tests {
             ["specs/project/topic/plan.md"]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_and_stages_scoped_implementation_paths() {
+        let root = test_directory("implementation-paths");
+        git_in(&root, &["init"]);
+        fs::write(root.join("tracked.txt"), "before\n").unwrap();
+        git_in(&root, &["add", "tracked.txt"]);
+        git_in(&root, &["commit", "-m", "initial"]);
+        fs::write(root.join("tracked.txt"), "after\n").unwrap();
+        fs::write(root.join("new.txt"), "new\n").unwrap();
+        fs::write(root.join("unrelated.txt"), "unrelated\n").unwrap();
+        fs::create_dir_all(root.join("openspec/specs")).unwrap();
+        fs::write(root.join("openspec/specs/spec.md"), "spec\n").unwrap();
+
+        let paths = validate_implementation_paths(
+            &root,
+            &[PathBuf::from("tracked.txt"), PathBuf::from("new.txt")],
+        )
+        .unwrap();
+        stage_publish_paths(&root, &paths).unwrap();
+
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["new.txt", "openspec/specs/spec.md", "tracked.txt"]
+        );
+        assert!(!git_output(&root, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .contains("unrelated.txt"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_deleted_paths_and_rejects_unsafe_paths() {
+        let root = test_directory("implementation-path-validation");
+        git_in(&root, &["init"]);
+        fs::write(root.join("deleted.txt"), "delete\n").unwrap();
+        git_in(&root, &["add", "deleted.txt"]);
+        git_in(&root, &["commit", "-m", "initial"]);
+        fs::remove_file(root.join("deleted.txt")).unwrap();
+        fs::create_dir_all(root.join("openspec/specs")).unwrap();
+        fs::write(root.join("openspec/specs/spec.md"), "spec\n").unwrap();
+
+        assert!(validate_implementation_paths(&root, &[PathBuf::from("deleted.txt")]).is_ok());
+        stage_publish_paths(&root, &[PathBuf::from("deleted.txt")]).unwrap();
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["deleted.txt", "openspec/specs/spec.md"]
+        );
+        for path in [
+            PathBuf::new(),
+            PathBuf::from("../outside"),
+            PathBuf::from("/tmp/outside"),
+            PathBuf::from("missing.txt"),
+        ] {
+            assert_eq!(
+                validate_implementation_paths(&root, &[path])
+                    .unwrap_err()
+                    .error,
+                "input_error"
+            );
+        }
+        let outside = test_directory("implementation-path-outside");
+        fs::write(outside.join("file.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("file.txt"), root.join("link.txt")).unwrap();
+        assert_eq!(
+            validate_implementation_paths(&root, &[PathBuf::from("link.txt")])
+                .unwrap_err()
+                .error,
+            "input_error"
+        );
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn republishes_existing_pull_request_with_scoped_changes() {
+        let root = test_directory("implementation-retry");
+        let origin = root.with_extension("origin.git");
+        git_in(&root, &["init"]);
+        git_in(&root, &["config", "user.email", "test@example.com"]);
+        git_in(&root, &["config", "user.name", "Test"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "base.txt"]);
+        git_in(&root, &["commit", "-m", "initial"]);
+        fs::create_dir_all(root.join("openspec/specs")).unwrap();
+        fs::write(root.join("openspec/specs/spec.md"), "spec\n").unwrap();
+        fs::write(root.join("src.txt"), "implementation\n").unwrap();
+        fs::write(root.join("unrelated.txt"), "leave out\n").unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "--bare"]);
+        let origin_url = origin.to_str().unwrap();
+        git_in(&root, &["remote", "add", "origin", origin_url]);
+
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let tea = bin.join("tea");
+        fs::write(
+            &tea,
+            r###"#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '[{"number":7,"headRefName":"feature/demo"}]'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then
+  exit 0
+fi
+exit 1
+"###,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tea).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tea, permissions).unwrap();
+        let old_path = std::env::var_os("PATH");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            old_path.as_deref().unwrap_or_default().to_string_lossy()
+        );
+        std::env::set_var("PATH", path);
+
+        let target = SpecTarget {
+            repository: "repo".into(),
+            specification: "agent-spec".into(),
+            agent: "agent".into(),
+            dependencies: vec![],
+            branch: "feature/demo".into(),
+        };
+        let result = publish_repository(
+            "demo",
+            "repo",
+            "https://gitea.example/owner/repo",
+            "main",
+            &root,
+            &target,
+            &[PathBuf::from("src.txt")],
+            "Update implementation",
+            Some("Update implementation"),
+        )
+        .unwrap();
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert_eq!(result["pull_request"]["number"], 7);
+        assert_eq!(result["pull_request"]["status"], "updated");
+        assert!(git_output(&root, &["diff", "--cached", "--quiet"]).is_ok());
+        assert!(git_output(&root, &["show", "--stat", "--oneline", "HEAD"])
+            .unwrap()
+            .contains("Update implementation"));
+        assert!(
+            !git_output(&root, &["show", "--name-only", "--format=", "HEAD"])
+                .unwrap()
+                .contains("unrelated.txt")
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(origin);
     }
 
     #[test]
