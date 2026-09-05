@@ -94,7 +94,7 @@ sceptre specset ready --manifest MANIFEST --catalog CATALOG
 sceptre specset next --manifest MANIFEST --catalog CATALOG
 sceptre specset status --manifest MANIFEST --catalog CATALOG [--repository ID]
 sceptre specset materialize --manifest MANIFEST --catalog CATALOG --worktree PATH
-sceptre specset publish --manifest MANIFEST --catalog CATALOG --worktree PATH --message MESSAGE [--title TITLE]
+sceptre specset publish --manifest MANIFEST --catalog CATALOG --worktree PATH --implementation-path PATH [--implementation-path PATH ...] --message MESSAGE [--title TITLE]
 sceptre specset feedback --upstream URL --number PR_NUMBER
 ```
 
@@ -116,6 +116,11 @@ inputs return `{"status":"blocked",...}` and no branch or PR operation is
 attempted. `next` and `status` use the deterministic implementation order and
 consider a matching merged PR complete. `publish` reuses
 `feature/<specset-id>` and updates the one matching PR when it already exists.
+`publish` requires at least one repeatable `--implementation-path` argument;
+paths are repository-relative and are validated before branch or provider
+operations. It stages the materialized `openspec/specs` subtree plus only those
+approved paths, including additions, modifications, and deletions. Unrelated
+worktree changes remain unstaged.
 Sceptre does not start workers, create worktrees, schedule jobs, or deploy
 services.
 
