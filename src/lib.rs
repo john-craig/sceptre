@@ -2860,6 +2860,7 @@ fn create_repository(
     let exists = provider_exists(&provider, &definition.upstream)?;
     if exists {
         verify_provider(&provider, &definition)?;
+        reconcile_grimoire_mapping(definition_path, &definition)?;
         if clone {
             let status = clone_or_reuse(
                 definition.local_path.as_deref(),
@@ -2892,16 +2893,17 @@ fn create_repository(
             )
         })?;
     let git_source = git_url(&source, use_https);
-    run_git(&["clone", "--depth", "1", &git_source, work.to_str().unwrap()])?;
+    run_git(&["clone", &git_source, work.to_str().unwrap()])?;
     let branch = &definition.default_branch;
     run_git_in(&work, &["checkout", "-B", branch])?;
     create_remote(&provider, &definition, &work)?;
     let git_upstream = git_url(&definition.upstream, use_https);
     run_git_in(&work, &["remote", "set-url", "origin", &git_upstream])?;
-    run_git_in(&work, &["push", "-u", "origin", branch])?;
+    run_git_in(&work, &["push", "-u", "origin", branch, "--force"])?;
     verify_remote(&work, &git_upstream, branch)?;
     verify_provider(&provider, &definition)?;
     let _ = fs::remove_dir_all(&work);
+    reconcile_grimoire_mapping(definition_path, &definition)?;
     if clone {
         let status = clone_or_reuse(
             definition.local_path.as_deref(),
@@ -2911,6 +2913,99 @@ fn create_repository(
         return Ok(result(&definition, &provider, status));
     }
     Ok(result(&definition, &provider, "created"))
+}
+
+fn reconcile_grimoire_mapping(
+    definition_path: &Path,
+    definition: &RepositoryDefinition,
+) -> Result<(), ErrorBody<'static>> {
+    let text = fs::read_to_string(definition_path).map_err(|_| {
+        err(
+            "input_error",
+            "cannot read repository definition for reconciliation".into(),
+        )
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        err(
+            "input_error",
+            "repository definition is not valid JSON".into(),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        err(
+            "input_error",
+            "repository definition must contain a JSON object".into(),
+        )
+    })?;
+    if object
+        .get("upstream_created")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Ok(());
+    }
+    object.insert("upstream_created".into(), serde_json::Value::Bool(true));
+    let rendered = serde_json::to_string_pretty(&value).map_err(|_| {
+        err(
+            "filesystem_error",
+            "cannot render repository definition".into(),
+        )
+    })?;
+    fs::write(definition_path, format!("{rendered}\n")).map_err(|_| {
+        err(
+            "filesystem_error",
+            "cannot update repository definition".into(),
+        )
+    })?;
+
+    let grimoire = definition_path
+        .parent()
+        .and_then(Path::parent)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let relative = if grimoire == Path::new(".") {
+        definition_path
+    } else {
+        definition_path.strip_prefix(&grimoire).map_err(|_| {
+            err(
+                "filesystem_error",
+                "repository definition is outside the Grimoire checkout".into(),
+            )
+        })?
+    };
+    let relative = relative.to_str().ok_or_else(|| {
+        err(
+            "filesystem_error",
+            "repository definition path is not UTF-8".into(),
+        )
+    })?;
+    run_git_in(&grimoire, &["add", "--", relative])?;
+    run_git_in(
+        &grimoire,
+        &[
+            "commit",
+            "-m",
+            &format!("Mark {} upstream as created", definition.id),
+        ],
+    )?;
+    run_git_in(&grimoire, &["push", "origin", &definition.default_branch])?;
+    let remote = git_output(
+        &grimoire,
+        &[
+            "ls-remote",
+            "origin",
+            &format!("refs/heads/{}", definition.default_branch),
+        ],
+    )?;
+    let local = git_output(&grimoire, &["rev-parse", "HEAD"])?;
+    if remote.split_whitespace().next().unwrap_or("") != local.trim() {
+        return Err(err(
+            "verification_failed",
+            "remote Grimoire branch does not contain the reconciliation commit".into(),
+        ));
+    }
+    Ok(())
 }
 
 struct IdeaInput<'a> {
@@ -3371,28 +3466,43 @@ fn provider_exists(provider: &Provider, upstream: &str) -> Result<bool, ErrorBod
     let repository = provider_repository(provider, upstream)?;
     let args = match provider {
         Provider::Github => vec!["repo", "view", upstream],
-        Provider::Gitea => vec!["repo", "show", &repository],
+        Provider::Gitea => {
+            let owner = repository.split('/').next().unwrap_or_default();
+            vec!["repos", "list", "--owner", owner, "--output", "json"]
+        }
     };
-    Ok(Command::new(provider.tool())
-        .args(args)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false))
+    let output = Command::new(provider.tool()).args(args).output().ok();
+    match (provider, output) {
+        (Provider::Github, Some(output)) => Ok(output.status.success()),
+        (Provider::Gitea, Some(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).contains(&repository))
+        }
+        _ => Ok(false),
+    }
 }
 fn create_remote(
     provider: &Provider,
     definition: &RepositoryDefinition,
     work: &Path,
 ) -> Result<(), ErrorBody<'static>> {
-    let visibility = match definition.visibility {
-        Visibility::Public => "--public",
-        Visibility::Private => "--private",
-        Visibility::Internal => "--internal",
-    };
     let repository = provider_repository(provider, &definition.upstream)?;
     let args = match provider {
-        Provider::Github => vec!["repo", "create", &definition.upstream, visibility],
-        Provider::Gitea => vec!["repo", "create", &repository, visibility],
+        Provider::Github => {
+            let visibility = match definition.visibility {
+                Visibility::Public => "--public",
+                Visibility::Private => "--private",
+                Visibility::Internal => "--internal",
+            };
+            vec!["repo", "create", &definition.upstream, visibility]
+        }
+        Provider::Gitea => {
+            let (_, name) = repository.split_once('/').unwrap();
+            let mut args = vec!["repos", "create", "--name", name];
+            if definition.visibility == Visibility::Private {
+                args.push("--private");
+            }
+            args
+        }
     };
     let _ = work;
     command(provider.tool(), &args, "create upstream repository")
@@ -3428,35 +3538,63 @@ fn verify_remote(work: &Path, upstream: &str, branch: &str) -> Result<(), ErrorB
     Ok(())
 }
 fn run_git(args: &[&str]) -> Result<(), ErrorBody<'static>> {
-    command("git", args, "clone template")
+    let git = git_binary();
+    command(&git, args, "clone template")
 }
 fn run_git_in(dir: &Path, args: &[&str]) -> Result<(), ErrorBody<'static>> {
-    Command::new("git")
+    git_command()
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|_| err("git_error", "could not execute git".into()))
+        .map_err(|error| {
+            err(
+                "git_error",
+                format!(
+                    "could not execute git in {} with {:?}: {error}",
+                    dir.display(),
+                    args
+                ),
+            )
+        })
         .and_then(|o| {
             if o.status.success() {
                 Ok(())
             } else {
-                Err(err("git_error", "git operation failed".into()))
+                Err(err(
+                    "git_error",
+                    format!(
+                        "git operation failed: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                ))
             }
         })
 }
 fn git_output(dir: &Path, args: &[&str]) -> Result<String, ErrorBody<'static>> {
-    Command::new("git")
+    git_command()
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|_| err("git_error", "could not execute git".into()))
+        .map_err(|error| err("git_error", format!("could not execute git: {error}")))
         .and_then(|o| {
             if o.status.success() {
                 Ok(String::from_utf8_lossy(&o.stdout).into_owned())
             } else {
-                Err(err("git_error", "git verification failed".into()))
+                Err(err(
+                    "git_error",
+                    format!(
+                        "git verification failed: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                ))
             }
         })
+}
+fn git_command() -> Command {
+    Command::new(git_binary())
+}
+fn git_binary() -> String {
+    std::env::var("SCEPTRE_GIT").unwrap_or_else(|_| "git".into())
 }
 fn command(tool: &str, args: &[&str], operation: &str) -> Result<(), ErrorBody<'static>> {
     Command::new(tool)
